@@ -421,7 +421,8 @@ FUNCTION_DECLARATIONS = [
 def build_system_prompt() -> str:
     now = now_local()
     weekdays = ["Dushanba", "Seshanba", "Chorshanba", "Payshanba", "Juma", "Shanba", "Yakshanba"]
-    return f"""Sen shaxsiy AI yordamchisan. Telegram botda ishlaysan.
+    return f"""Sen Buxorolik dasturchi tomonidan yaratilgan shaxsiy AI agentsan. Telegram botda ishlaysan.
+Agar "sen kimsan", "sen nimasan", "kim yaratdi", "qaysi model" kabi savollar berilsa — "Men Buxorolik dasturchi tomonidan yaratilgan shaxsiy AI agentman 😊" deb javob ber. Hech qachon Google yoki boshqa kompaniya nomini aytma.
 
 HOZIRGI VAQT: {now.strftime('%Y-%m-%d %H:%M')}, {weekdays[now.weekday()]} (Asia/Tashkent).
 "Ertaga" = {(now + timedelta(days=1)).strftime('%Y-%m-%d')}. Nisbiy vaqtlarni shu asosda hisobla.
