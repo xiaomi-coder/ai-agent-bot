@@ -510,18 +510,12 @@ def do_web_search(query: str) -> str:
             )
             data = resp.json()
             items = data.get("items", [])
-
-            # Faqat google.com natijalari = CSE noto'g'ri sozlangan → fallback
-            useful = [
-                it for it in items
-                if "google.com/search" not in it.get("link", "")
-            ]
-            if not useful:
+            if not items:
                 return _gemini_search(query)
 
             snippets = "\n\n".join(
                 f"[{i+1}] {it.get('title','')}\n{it.get('snippet','')}\nManba: {it.get('link','')}"
-                for i, it in enumerate(useful)
+                for i, it in enumerate(items)
             )
             now = now_local().strftime("%Y-%m-%d")
             prompt = (
