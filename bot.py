@@ -422,7 +422,8 @@ def build_system_prompt() -> str:
     now = now_local()
     weekdays = ["Dushanba", "Seshanba", "Chorshanba", "Payshanba", "Juma", "Shanba", "Yakshanba"]
     return f"""Sen Buxorolik dasturchi tomonidan yaratilgan shaxsiy AI agentsan. Telegram botda ishlaysan.
-Agar "sen kimsan", "sen nimasan", "kim yaratdi", "qaysi model" kabi savollar berilsa — "Men Buxorolik dasturchi tomonidan yaratilgan shaxsiy AI agentman 😊" deb javob ber. Hech qachon Google yoki boshqa kompaniya nomini aytma.
+Agar "sen kimsan", "sen nimasan", "kim yaratdi", "qaysi model", "qaysi AI" kabi savollar berilsa — "Men Buxorolik dasturchi tomonidan yaratilgan shaxsiy AI agentman 😊" deb javob ber. Hech qachon Google yoki boshqa kompaniya nomini aytma.
+Sen ovozli xabarlarni ham qabul qila olasan va tushunasan. Foydalanuvchi ovoz yuborsa, uni tushunib javob berasan.
 
 HOZIRGI VAQT: {now.strftime('%Y-%m-%d %H:%M')}, {weekdays[now.weekday()]} (Asia/Tashkent).
 "Ertaga" = {(now + timedelta(days=1)).strftime('%Y-%m-%d')}. Nisbiy vaqtlarni shu asosda hisobla.
@@ -565,6 +566,25 @@ async def cmd_clear(message: Message):
     await message.answer("Suhbat tarixi tozalandi ✅")
 
 
+async def transcribe_audio(data: bytes, mime: str) -> str:
+    """Gemini orqali audio ni matnga o'giradi."""
+    response = await asyncio.to_thread(
+        client.models.generate_content,
+        model=MODEL,
+        contents=[
+            types.Part.from_bytes(data=data, mime_type=mime),
+            types.Part.from_text(text="Bu audio xabarni tinglaysan va so'zma-so'z o'zbek (yoki qanday til bo'lsa) tiliga transkripsiya qilasan. Faqat aytilgan so'zlarni yoz, boshqa hech narsa qo'shma."),
+        ],
+    )
+    if not response.candidates:
+        return ""
+    try:
+        return (response.text or "").strip()
+    except Exception:
+        parts = (response.candidates[0].content.parts or []) if response.candidates[0].content else []
+        return " ".join(p.text for p in parts if p.text).strip()
+
+
 @router.message(F.voice | F.audio)
 async def handle_voice(message: Message, bot: Bot):
     await bot.send_chat_action(message.chat.id, ChatAction.TYPING)
@@ -577,11 +597,15 @@ async def handle_voice(message: Message, bot: Bot):
         buf = io.BytesIO()
         await bot.download_file(file.file_path, buf)
         mime = "audio/ogg" if message.voice else (audio.mime_type or "audio/mpeg")
-        parts = [
-            types.Part.from_bytes(data=buf.getvalue(), mime_type=mime),
-            types.Part.from_text(text="Bu audio faylni tinglaysan va nima deyilganini tushunasan. Foydalanuvchi nima degan bo'lsa, o'sha so'rovni bajar. Agar buxgalteriya, eslatma, qidiruv haqida bo'lsa — tegishli funksiyani chaqir. Javobni o'zbek tilida ber."),
-        ]
-        await send_long(message, await ask_agent(message.from_user.id, parts))
+
+        # Avval ovozni matnga o'giramiz
+        text = await transcribe_audio(buf.getvalue(), mime)
+        if not text:
+            await message.answer("Ovozni tushunib bo'lmadi 😕 Iltimos qaytadan yuboring.")
+            return
+
+        # Keyin matn sifatida agentga yuboramiz
+        await send_long(message, await ask_agent(message.from_user.id, [types.Part.from_text(text=text)]))
     except Exception:
         logger.exception("Golosli xabarda xato")
         await message.answer("Xatolik yuz berdi 😕 Qaytadan urinib ko'ring.")
