@@ -150,32 +150,55 @@ def db_add_transaction(user_id: int, tx_type: str, amount: float, category: str,
     return f"Yozildi: {tx_type} {amount:,.0f} so'm, kategoriya: {category}" + (f" ({note})" if note else "")
 
 
-def db_get_report(user_id: int, period: str) -> str:
+def db_get_report(user_id: int, period: str = "oy", start_date: str = "", end_date: str = "") -> str:
     now = now_local().replace(tzinfo=None)
-    if period == "bugun":
-        start = now.replace(hour=0, minute=0, second=0)
-    elif period == "hafta":
-        start = now - timedelta(days=7)
+    label = period
+
+    # Aniq sana oralig'i berilgan bo'lsa — o'shani ishlatamiz
+    if start_date:
+        try:
+            start = datetime.strptime(start_date, "%Y-%m-%d")
+        except ValueError:
+            return "Boshlanish sanasi noto'g'ri (YYYY-MM-DD bo'lishi kerak)."
+        if end_date:
+            try:
+                end = datetime.strptime(end_date, "%Y-%m-%d").replace(hour=23, minute=59, second=59)
+            except ValueError:
+                return "Tugash sanasi noto'g'ri (YYYY-MM-DD bo'lishi kerak)."
+        else:
+            end = start.replace(hour=23, minute=59, second=59)
+        label = f"{start_date}" + (f" — {end_date}" if end_date and end_date != start_date else "")
     else:
-        start = now - timedelta(days=30)
+        end = now
+        if period == "bugun":
+            start = now.replace(hour=0, minute=0, second=0)
+        elif period == "kecha":
+            y = now - timedelta(days=1)
+            start = y.replace(hour=0, minute=0, second=0)
+            end = y.replace(hour=23, minute=59, second=59)
+            label = "kecha"
+        elif period == "hafta":
+            start = now - timedelta(days=7)
+        else:
+            start = now - timedelta(days=30)
 
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """SELECT type, category, SUM(amount), COUNT(*)
                    FROM transactions
-                   WHERE user_id = %s AND created_at >= %s
+                   WHERE user_id = %s AND created_at >= %s AND created_at <= %s
                    GROUP BY type, category
                    ORDER BY type, SUM(amount) DESC""",
-                (user_id, start),
+                (user_id, start, end),
             )
             rows = cur.fetchall()
 
     if not rows:
-        return f"Bu davr ({period}) uchun yozuvlar topilmadi."
+        return f"Bu davr ({label}) uchun yozuvlar topilmadi."
 
     kirim_total, chiqim_total = 0.0, 0.0
-    lines = [f"Hisobot ({period}):"]
+    lines = [f"Hisobot ({label}):"]
     for row in rows:
         tx_type, category, total, count = row["type"], row["category"], row["sum"], row["count"]
         lines.append(f"- {tx_type} | {category}: {total:,.0f} so'm ({count} ta)")
@@ -735,11 +758,14 @@ FUNCTION_DECLARATIONS = [
     ),
     types.FunctionDeclaration(
         name="get_report",
-        description="Kirim-chiqim hisoboti. 'Qancha sarfladim', 'hisobot', 'balans' desa ishlatiladi.",
+        description="Kirim-chiqim hisoboti. 'Qancha sarfladim', 'hisobot', 'balans' desa ishlatiladi. Aniq sana oralig'i so'ralsa (masalan '1-iyundan 10-iyungacha', 'shu oyning 5-sanasi') start_date/end_date ber.",
         parameters=types.Schema(
             type=types.Type.OBJECT,
-            properties={"period": types.Schema(type=types.Type.STRING, enum=["bugun", "hafta", "oy"])},
-            required=["period"],
+            properties={
+                "period": types.Schema(type=types.Type.STRING, enum=["bugun", "kecha", "hafta", "oy"], description="Tayyor davr. Aniq sana berilsa bo'sh qoldir."),
+                "start_date": types.Schema(type=types.Type.STRING, description="Boshlanish sanasi 'YYYY-MM-DD' (ixtiyoriy)"),
+                "end_date": types.Schema(type=types.Type.STRING, description="Tugash sanasi 'YYYY-MM-DD' (ixtiyoriy, berilmasa start_date kuni)"),
+            },
         ),
     ),
     types.FunctionDeclaration(
@@ -864,7 +890,10 @@ def execute_function(user_id: int, name: str, args: dict) -> str:
                 args.get("category", "boshqa"), args.get("note", ""),
             )
         if name == "get_report":
-            return db_get_report(user_id, args.get("period", "oy"))
+            return db_get_report(
+                user_id, args.get("period", "oy"),
+                args.get("start_date", ""), args.get("end_date", ""),
+            )
         if name == "delete_last_transaction":
             return db_delete_last(user_id)
         if name == "set_reminder":
