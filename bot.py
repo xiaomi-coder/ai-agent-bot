@@ -27,7 +27,9 @@ from psycopg2.extras import RealDictCursor
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.enums import ChatAction
 from aiogram.filters import Command, CommandStart
-from aiogram.types import Message
+from aiogram.types import (
+    Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+)
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from dotenv import load_dotenv
 from google import genai
@@ -39,7 +41,10 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 DATABASE_URL = os.getenv("DATABASE_URL")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 TZ = ZoneInfo(os.getenv("TZ", "Asia/Tashkent"))
+
+bot_enabled = True  # admin o'chirishi mumkin
 
 if not BOT_TOKEN or not GEMINI_API_KEY:
     raise SystemExit("Xato: .env faylda BOT_TOKEN va GEMINI_API_KEY bo'lishi shart!")
@@ -95,6 +100,16 @@ def db_init():
                     user_id BIGINT NOT NULL,
                     text TEXT NOT NULL,
                     created_at TIMESTAMP NOT NULL DEFAULT NOW()
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    user_id BIGINT PRIMARY KEY,
+                    username TEXT,
+                    full_name TEXT,
+                    first_seen TIMESTAMP NOT NULL DEFAULT NOW(),
+                    last_seen TIMESTAMP NOT NULL DEFAULT NOW(),
+                    message_count INTEGER NOT NULL DEFAULT 0
                 )
             """)
 
@@ -292,6 +307,70 @@ def db_delete_note(user_id: int, note_id: int) -> str:
             cur.execute("DELETE FROM notes WHERE id = %s AND user_id = %s", (note_id, user_id))
             deleted = cur.rowcount
     return f"№{note_id} qayd o'chirildi." if deleted else f"№{note_id} qayd topilmadi."
+
+
+# --- Admin funksiyalar ---
+
+def db_track_user(user_id: int, username: str | None, full_name: str):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO users (user_id, username, full_name)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (user_id) DO UPDATE
+                SET username = EXCLUDED.username,
+                    full_name = EXCLUDED.full_name,
+                    last_seen = NOW(),
+                    message_count = users.message_count + 1
+            """, (user_id, username, full_name))
+
+
+def db_admin_stats() -> str:
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) as cnt FROM users")
+            total_users = cur.fetchone()["cnt"]
+            cur.execute("SELECT COUNT(*) as cnt FROM users WHERE last_seen >= NOW() - INTERVAL '24 hours'")
+            active_today = cur.fetchone()["cnt"]
+            cur.execute("SELECT COUNT(*) as cnt FROM users WHERE last_seen >= NOW() - INTERVAL '7 days'")
+            active_week = cur.fetchone()["cnt"]
+            cur.execute("SELECT SUM(message_count) as cnt FROM users")
+            total_msgs = cur.fetchone()["cnt"] or 0
+            cur.execute("SELECT COUNT(*) as cnt FROM reminders WHERE sent = 0")
+            active_reminders = cur.fetchone()["cnt"]
+    return (
+        f"📊 Bot statistikasi:\n\n"
+        f"👥 Jami foydalanuvchilar: {total_users}\n"
+        f"🟢 Bugun faol: {active_today}\n"
+        f"📅 Hafta faol: {active_week}\n"
+        f"💬 Jami xabarlar: {total_msgs}\n"
+        f"⏰ Faol eslatmalar: {active_reminders}"
+    )
+
+
+def db_admin_users(limit: int = 10) -> str:
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT user_id, username, full_name, message_count, last_seen
+                FROM users ORDER BY last_seen DESC LIMIT %s
+            """, (limit,))
+            rows = cur.fetchall()
+    if not rows:
+        return "Foydalanuvchilar yo'q."
+    lines = ["👥 Oxirgi foydalanuvchilar:\n"]
+    for r in rows:
+        name = f"@{r['username']}" if r['username'] else r['full_name']
+        last = str(r['last_seen'])[:16]
+        lines.append(f"• {name} — {r['message_count']} xabar ({last})")
+    return "\n".join(lines)
+
+
+def db_get_all_user_ids() -> list[int]:
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT user_id FROM users")
+            return [r["user_id"] for r in cur.fetchall()]
 
 
 # ============================================================
@@ -536,8 +615,78 @@ async def ask_agent(user_id: int, user_parts: list[types.Part]) -> str:
 router = Router()
 
 
+def admin_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📊 Statistika", callback_data="admin_stats"),
+         InlineKeyboardButton(text="👥 Foydalanuvchilar", callback_data="admin_users")],
+        [InlineKeyboardButton(text="📢 Broadcast", callback_data="admin_broadcast"),
+         InlineKeyboardButton(text="🔴 Botni o'chir" if bot_enabled else "🟢 Botni yoq", callback_data="admin_toggle")],
+    ])
+
+
+@router.message(Command("admin"))
+async def cmd_admin(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    await message.answer("🛠 Admin panel:", reply_markup=admin_keyboard())
+
+
+@router.callback_query(F.data.startswith("admin_"))
+async def admin_callback(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("Ruxsat yo'q!")
+        return
+
+    global bot_enabled
+    action = callback.data
+
+    if action == "admin_stats":
+        text = await asyncio.to_thread(db_admin_stats)
+        await callback.message.edit_text(text, reply_markup=admin_keyboard())
+
+    elif action == "admin_users":
+        text = await asyncio.to_thread(db_admin_users)
+        await callback.message.edit_text(text, reply_markup=admin_keyboard())
+
+    elif action == "admin_toggle":
+        bot_enabled = not bot_enabled
+        status = "🟢 Bot yoqildi!" if bot_enabled else "🔴 Bot o'chirildi!"
+        await callback.message.edit_text(f"Admin panel:\n{status}", reply_markup=admin_keyboard())
+
+    elif action == "admin_broadcast":
+        await callback.message.edit_text(
+            "📢 Broadcast xabar yuboring:\n/broadcast <xabar matni>",
+            reply_markup=admin_keyboard()
+        )
+
+    await callback.answer()
+
+
+@router.message(Command("broadcast"))
+async def cmd_broadcast(message: Message, bot: Bot):
+    if message.from_user.id != ADMIN_ID:
+        return
+    text = message.text.removeprefix("/broadcast").strip()
+    if not text:
+        await message.answer("Foydalanish: /broadcast <xabar matni>")
+        return
+    user_ids = await asyncio.to_thread(db_get_all_user_ids)
+    sent, failed = 0, 0
+    for uid in user_ids:
+        try:
+            await bot.send_message(uid, f"📢 {text}")
+            sent += 1
+        except Exception:
+            failed += 1
+    await message.answer(f"Broadcast tugadi: {sent} ta yuborildi, {failed} ta xato.")
+
+
 @router.message(CommandStart())
 async def cmd_start(message: Message):
+    await asyncio.to_thread(
+        db_track_user, message.from_user.id,
+        message.from_user.username, message.from_user.full_name
+    )
     await message.answer(
         "Salom! 👋 Men sizning shaxsiy yordamchingizman.\n\n"
         "🔎 Internetdan ma'lumot — \"Dollar kursi qancha?\"\n"
@@ -587,6 +736,10 @@ async def transcribe_audio(data: bytes, mime: str) -> str:
 
 @router.message(F.voice | F.audio)
 async def handle_voice(message: Message, bot: Bot):
+    if not bot_enabled and message.from_user.id != ADMIN_ID:
+        await message.answer("Bot vaqtincha o'chirilgan. Tez orada qaytamiz!")
+        return
+    await asyncio.to_thread(db_track_user, message.from_user.id, message.from_user.username, message.from_user.full_name)
     await bot.send_chat_action(message.chat.id, ChatAction.TYPING)
     try:
         audio = message.voice or message.audio
@@ -613,7 +766,10 @@ async def handle_voice(message: Message, bot: Bot):
 
 @router.message(F.photo)
 async def handle_photo(message: Message, bot: Bot):
-    """Rasm — chek bo'lsa summani o'qib bazaga yozadi, boshqa rasm bo'lsa tahlil qiladi."""
+    if not bot_enabled and message.from_user.id != ADMIN_ID:
+        await message.answer("Bot vaqtincha o'chirilgan. Tez orada qaytamiz!")
+        return
+    await asyncio.to_thread(db_track_user, message.from_user.id, message.from_user.username, message.from_user.full_name)
     await bot.send_chat_action(message.chat.id, ChatAction.TYPING)
     try:
         photo = message.photo[-1]  # eng katta o'lcham
@@ -642,6 +798,10 @@ async def handle_photo(message: Message, bot: Bot):
 
 @router.message(F.text)
 async def handle_text(message: Message, bot: Bot):
+    if not bot_enabled and message.from_user.id != ADMIN_ID:
+        await message.answer("Bot vaqtincha o'chirilgan. Tez orada qaytamiz!")
+        return
+    await asyncio.to_thread(db_track_user, message.from_user.id, message.from_user.username, message.from_user.full_name)
     await bot.send_chat_action(message.chat.id, ChatAction.TYPING)
     try:
         await send_long(message, await ask_agent(message.from_user.id, [types.Part.from_text(text=message.text)]))
