@@ -21,6 +21,7 @@ import os
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
+import requests
 import psycopg2
 from psycopg2.extras import RealDictCursor
 
@@ -42,6 +43,8 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 DATABASE_URL = os.getenv("DATABASE_URL")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+GOOGLE_CSE_KEY = os.getenv("GOOGLE_CSE_KEY", "")
+GOOGLE_CSE_ID = os.getenv("GOOGLE_CSE_ID", "")
 TZ = ZoneInfo(os.getenv("TZ", "Asia/Tashkent"))
 
 bot_enabled = True  # admin o'chirishi mumkin
@@ -492,6 +495,45 @@ def db_get_memory(user_id: int) -> str:
 # ============================================================
 
 def do_web_search(query: str) -> str:
+    # Google Custom Search API (aniq natijalar)
+    if GOOGLE_CSE_KEY and GOOGLE_CSE_ID:
+        try:
+            resp = requests.get(
+                "https://www.googleapis.com/customsearch/v1",
+                params={
+                    "key": GOOGLE_CSE_KEY,
+                    "cx": GOOGLE_CSE_ID,
+                    "q": query,
+                    "num": 5,
+                    "lr": "lang_uz|lang_ru",
+                },
+                timeout=10,
+            )
+            data = resp.json()
+            items = data.get("items", [])
+            if not items:
+                return _gemini_search(query)  # fallback
+
+            # Natijalarni Gemini ga tahlil qildirish
+            snippets = "\n\n".join(
+                f"[{i+1}] {it.get('title','')}\n{it.get('snippet','')}\nURL: {it.get('link','')}"
+                for i, it in enumerate(items)
+            )
+            prompt = (
+                f"Quyidagi qidiruv natijalari asosida '{query}' savoliga qisqa va aniq javob ber (o'zbek tilida):\n\n"
+                f"{snippets}\n\nFaqat natijalar asosida javob ber."
+            )
+            resp2 = client.models.generate_content(model=MODEL, contents=prompt)
+            return (resp2.text or "").strip() or snippets
+        except Exception as e:
+            logger.exception("Google CSE xato")
+            return _gemini_search(query)
+
+    return _gemini_search(query)
+
+
+def _gemini_search(query: str) -> str:
+    """Fallback: Gemini grounding bilan qidirish."""
     try:
         response = client.models.generate_content(
             model=MODEL,
@@ -503,14 +545,12 @@ def do_web_search(query: str) -> str:
         if not response.candidates:
             return "Qidiruv natijasi topilmadi."
         try:
-            text = (response.text or "").strip()
+            return (response.text or "").strip() or "Ma'lumot topilmadi."
         except Exception:
-            # grounding metadata bor, text yo'q — parts dan qidiramiz
             parts = response.candidates[0].content.parts if response.candidates[0].content else []
-            text = " ".join(p.text for p in parts if p.text).strip()
-        return text or "Ma'lumot topilmadi."
+            return " ".join(p.text for p in parts if p.text).strip() or "Ma'lumot topilmadi."
     except Exception as e:
-        logger.exception("Qidiruvda xato")
+        logger.exception("Gemini search xato")
         return f"Qidiruvda xatolik: {e}"
 
 
