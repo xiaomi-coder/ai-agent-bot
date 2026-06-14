@@ -579,7 +579,7 @@ async def handle_voice(message: Message, bot: Bot):
         mime = "audio/ogg" if message.voice else (audio.mime_type or "audio/mpeg")
         parts = [
             types.Part.from_bytes(data=buf.getvalue(), mime_type=mime),
-            types.Part.from_text(text="Bu golosli xabarni tushunib, kerak bo'lsa funksiya chaqirib, javob ber."),
+            types.Part.from_text(text="Bu audio faylni tinglaysan va nima deyilganini tushunasan. Foydalanuvchi nima degan bo'lsa, o'sha so'rovni bajar. Agar buxgalteriya, eslatma, qidiruv haqida bo'lsa — tegishli funksiyani chaqir. Javobni o'zbek tilida ber."),
         ]
         await send_long(message, await ask_agent(message.from_user.id, parts))
     except Exception:
