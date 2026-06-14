@@ -495,7 +495,7 @@ def db_get_memory(user_id: int) -> str:
 # ============================================================
 
 def do_web_search(query: str) -> str:
-    # Google Custom Search API (aniq natijalar)
+    # 1-urinish: Google Custom Search API
     if GOOGLE_CSE_KEY and GOOGLE_CSE_ID:
         try:
             resp = requests.get(
@@ -504,28 +504,37 @@ def do_web_search(query: str) -> str:
                     "key": GOOGLE_CSE_KEY,
                     "cx": GOOGLE_CSE_ID,
                     "q": query,
-                    "num": 5,
-                    "lr": "lang_uz|lang_ru",
+                    "num": 6,
                 },
-                timeout=10,
+                timeout=12,
             )
             data = resp.json()
             items = data.get("items", [])
-            if not items:
-                return _gemini_search(query)  # fallback
 
-            # Natijalarni Gemini ga tahlil qildirish
+            # Faqat google.com natijalari = CSE noto'g'ri sozlangan → fallback
+            useful = [
+                it for it in items
+                if "google.com/search" not in it.get("link", "")
+            ]
+            if not useful:
+                return _gemini_search(query)
+
             snippets = "\n\n".join(
-                f"[{i+1}] {it.get('title','')}\n{it.get('snippet','')}\nURL: {it.get('link','')}"
-                for i, it in enumerate(items)
+                f"[{i+1}] {it.get('title','')}\n{it.get('snippet','')}\nManba: {it.get('link','')}"
+                for i, it in enumerate(useful)
             )
+            now = now_local().strftime("%Y-%m-%d")
             prompt = (
-                f"Quyidagi qidiruv natijalari asosida '{query}' savoliga qisqa va aniq javob ber (o'zbek tilida):\n\n"
-                f"{snippets}\n\nFaqat natijalar asosida javob ber."
+                f"Bugungi sana: {now}. Quyidagi internet qidiruv natijalari asosida "
+                f"'{query}' savoliga aniq, qisqa javob ber (o'zbek tilida).\n\n"
+                f"{snippets}\n\n"
+                f"MUHIM: Faqat natijalardagi ma'lumotga tayan. Agar natijalarda javob bo'lmasa, "
+                f"'Bu haqda aniq ma'lumot topilmadi' deb ayt. O'zingdan to'qib chiqarma."
             )
             resp2 = client.models.generate_content(model=MODEL, contents=prompt)
-            return (resp2.text or "").strip() or snippets
-        except Exception as e:
+            answer = (resp2.text or "").strip()
+            return answer or snippets
+        except Exception:
             logger.exception("Google CSE xato")
             return _gemini_search(query)
 
@@ -555,17 +564,111 @@ def _gemini_search(query: str) -> str:
 
 
 # ============================================================
+# OB-HAVO (Open-Meteo — bepul, kalitsiz, aniq)
+# ============================================================
+
+_WEATHER_CODES = {
+    0: "ochiq, quyoshli", 1: "asosan ochiq", 2: "qisman bulutli", 3: "bulutli",
+    45: "tumanli", 48: "qirovli tuman", 51: "yengil shivalama", 53: "shivalama",
+    55: "kuchli shivalama", 56: "muzli shivalama", 57: "kuchli muzli shivalama",
+    61: "yengil yomg'ir", 63: "yomg'ir", 65: "kuchli yomg'ir",
+    66: "muzli yomg'ir", 67: "kuchli muzli yomg'ir",
+    71: "yengil qor", 73: "qor", 75: "kuchli qor", 77: "qor donalari",
+    80: "yengil jala", 81: "jala", 82: "kuchli jala",
+    85: "yengil qor jalasi", 86: "kuchli qor jalasi",
+    95: "momaqaldiroq", 96: "do'lli momaqaldiroq", 99: "kuchli do'lli momaqaldiroq",
+}
+
+
+def do_get_weather(location: str, when: str = "bugun") -> str:
+    try:
+        geo = requests.get(
+            "https://geocoding-api.open-meteo.com/v1/search",
+            params={"name": location, "count": 1, "language": "ru"},
+            timeout=10,
+        ).json()
+        results = geo.get("results")
+        if not results:
+            return f"'{location}' joyi topilmadi. Shahar nomini aniqroq yozing."
+        place = results[0]
+        lat, lon = place["latitude"], place["longitude"]
+        name = place.get("name", location)
+        country = place.get("country", "")
+
+        wx = requests.get(
+            "https://api.open-meteo.com/v1/forecast",
+            params={
+                "latitude": lat, "longitude": lon,
+                "current": "temperature_2m,relative_humidity_2m,weather_code,wind_speed_10m,apparent_temperature",
+                "daily": "temperature_2m_max,temperature_2m_min,weather_code",
+                "timezone": "auto", "forecast_days": 3,
+            },
+            timeout=10,
+        ).json()
+
+        cur = wx.get("current", {})
+        daily = wx.get("daily", {})
+        code = cur.get("weather_code", 0)
+        desc = _WEATHER_CODES.get(code, "noma'lum")
+
+        loc_label = f"{name}" + (f", {country}" if country else "")
+
+        if when in ("ertaga", "tomorrow"):
+            idx = 1
+            day_label = "Ertaga"
+        elif when in ("indinga", "after_tomorrow"):
+            idx = 2
+            day_label = "Indinga"
+        else:
+            # bugun — joriy ob-havo
+            tmax = daily.get("temperature_2m_max", [None])[0]
+            tmin = daily.get("temperature_2m_min", [None])[0]
+            return (
+                f"🌤 {loc_label} — bugun:\n"
+                f"Hozir: {cur.get('temperature_2m')}°C (his: {cur.get('apparent_temperature')}°C), {desc}\n"
+                f"Kun davomida: {tmin}…{tmax}°C\n"
+                f"Namlik: {cur.get('relative_humidity_2m')}%, shamol: {cur.get('wind_speed_10m')} km/soat"
+            )
+
+        codes = daily.get("weather_code", [])
+        tmax = daily.get("temperature_2m_max", [])
+        tmin = daily.get("temperature_2m_min", [])
+        if len(codes) > idx:
+            d_desc = _WEATHER_CODES.get(codes[idx], "noma'lum")
+            return (
+                f"🌤 {loc_label} — {day_label.lower()}:\n"
+                f"Harorat: {tmin[idx]}…{tmax[idx]}°C, {d_desc}"
+            )
+        return f"{loc_label} uchun {day_label.lower()} prognozi topilmadi."
+    except Exception as e:
+        logger.exception("Ob-havo xato")
+        return f"Ob-havo ma'lumotini olishda xatolik: {e}"
+
+
+# ============================================================
 # GEMINI FUNCTION CALLING
 # ============================================================
 
 FUNCTION_DECLARATIONS = [
     types.FunctionDeclaration(
         name="web_search",
-        description="Internetdan yangi va aniq ma'lumot qidirish (kurslar, yangiliklar, narxlar, ob-havo, faktlar).",
+        description="Internetdan yangi ma'lumot qidirish (yangiliklar, narxlar, valyuta kursi, mashhur odamlar, faktlar). DIQQAT: ob-havo uchun bu emas, get_weather ishlat!",
         parameters=types.Schema(
             type=types.Type.OBJECT,
-            properties={"query": types.Schema(type=types.Type.STRING, description="Qidiruv so'rovi")},
+            properties={"query": types.Schema(type=types.Type.STRING, description="Qidiruv so'rovi. Aniq bo'lsin: agar O'zbekistonga oid bo'lsa 'O'zbekiston' so'zini qo'sh.")},
             required=["query"],
+        ),
+    ),
+    types.FunctionDeclaration(
+        name="get_weather",
+        description="Ob-havo ma'lumotini olish. 'Ob-havo qanaqa', 'bugun/ertaga havo' kabi savollarda ishlatiladi. Real aniq ma'lumot beradi.",
+        parameters=types.Schema(
+            type=types.Type.OBJECT,
+            properties={
+                "location": types.Schema(type=types.Type.STRING, description="Shahar yoki tuman nomi (masalan: Buxoro, G'ijduvon, Toshkent)"),
+                "when": types.Schema(type=types.Type.STRING, enum=["bugun", "ertaga", "indinga"], description="Qaysi kun"),
+            },
+            required=["location"],
         ),
     ),
     types.FunctionDeclaration(
@@ -681,15 +784,17 @@ HOZIRGI VAQT: {now.strftime('%Y-%m-%d %H:%M')}, {weekdays[now.weekday()]} (Asia/
 "Ertaga" = {(now + timedelta(days=1)).strftime('%Y-%m-%d')}. Nisbiy vaqtlarni shu asosda hisobla.
 
 Imkoniyatlaring:
-1. Internet qidiruv (web_search) — yangi ma'lumot kerak bo'lsa taxmin qilma, qidir!
-2. Buxgalteriya — xarajat/daromad aytilsa add_transaction. Hisobot so'ralsa get_report.
-3. Eslatmalar — set_reminder (vaqtni aniq 'YYYY-MM-DD HH:MM' ga aylantir).
-4. Qaydlar — "eslab qol" desa add_note, "nima edi?" desa find_notes.
-5. Rasmlar — chek/kvitansiya rasmi kelsa, summa va do'konni aniqlab add_transaction chaqir va nimani yozganingni ayt.
+1. Internet qidiruv (web_search) — yangi ma'lumot kerak bo'lsa taxmin qilma, qidir! O'zbekistonga oid odam/joy bo'lsa qidiruvga "O'zbekiston" qo'sh.
+2. Ob-havo (get_weather) — ob-havo so'ralsa SHU funksiyani ishlat, web_search EMAS. Joy aytilmasa, profildagi joyni yoki "Toshkent" ni ol.
+3. Buxgalteriya — xarajat/daromad aytilsa add_transaction. Hisobot so'ralsa get_report.
+4. Eslatmalar — set_reminder (vaqtni aniq 'YYYY-MM-DD HH:MM' ga aylantir).
+5. Qaydlar — "eslab qol" desa add_note, "nima edi?" desa find_notes.
+6. Rasmlar — chek/kvitansiya rasmi kelsa, summa va do'konni aniqlab add_transaction chaqir.
 
 Qoidalar:
 - Foydalanuvchi qaysi tilda gapirsa, o'sha tilda javob ber (asosan o'zbek).
-- Javoblar qisqa va aniq.
+- Javoblar qisqa va aniq. Aniq bilmasang "aniq ma'lumot topa olmadim" deb ayt — YOLG'ON to'qima!
+- Foydalanuvchi avvalgi xabariga "ha", "yo'q" desa — kontekstni esla, qayta so'rama.
 - Summalar: "50 ming" = 50000, "1.5 mln" = 1500000.
 - Funksiya natijasini chiroyli, tushunarli qilib yetkaz.
 {profile_section}{memory_section}
@@ -700,6 +805,8 @@ def execute_function(user_id: int, name: str, args: dict) -> str:
     try:
         if name == "web_search":
             return do_web_search(args.get("query", ""))
+        if name == "get_weather":
+            return do_get_weather(args.get("location", "Toshkent"), args.get("when", "bugun"))
         if name == "add_transaction":
             return db_add_transaction(
                 user_id, args.get("tx_type", "chiqim"), float(args.get("amount", 0)),
