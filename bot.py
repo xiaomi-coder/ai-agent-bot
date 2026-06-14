@@ -109,8 +109,13 @@ def db_init():
                     full_name TEXT,
                     first_seen TIMESTAMP NOT NULL DEFAULT NOW(),
                     last_seen TIMESTAMP NOT NULL DEFAULT NOW(),
-                    message_count INTEGER NOT NULL DEFAULT 0
+                    message_count INTEGER NOT NULL DEFAULT 0,
+                    approved BOOLEAN NOT NULL DEFAULT FALSE
                 )
+            """)
+            # Eski bazada approved column bo'lmasa qo'shamiz
+            cur.execute("""
+                ALTER TABLE users ADD COLUMN IF NOT EXISTS approved BOOLEAN NOT NULL DEFAULT FALSE
             """)
 
 
@@ -369,8 +374,42 @@ def db_admin_users(limit: int = 10) -> str:
 def db_get_all_user_ids() -> list[int]:
     with get_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT user_id FROM users")
+            cur.execute("SELECT user_id FROM users WHERE approved = TRUE")
             return [r["user_id"] for r in cur.fetchall()]
+
+
+def db_is_approved(user_id: int) -> bool:
+    if user_id == ADMIN_ID:
+        return True
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT approved FROM users WHERE user_id = %s", (user_id,))
+            row = cur.fetchone()
+            return bool(row and row["approved"])
+
+
+def db_approve_user(user_id: int) -> bool:
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE users SET approved = TRUE WHERE user_id = %s", (user_id,))
+            return cur.rowcount > 0
+
+
+def db_revoke_user(user_id: int) -> bool:
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE users SET approved = FALSE WHERE user_id = %s", (user_id,))
+            return cur.rowcount > 0
+
+
+def db_pending_users() -> list[dict]:
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT user_id, username, full_name, first_seen
+                FROM users WHERE approved = FALSE ORDER BY first_seen DESC LIMIT 20
+            """)
+            return cur.fetchall()
 
 
 # ============================================================
@@ -619,8 +658,9 @@ def admin_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📊 Statistika", callback_data="admin_stats"),
          InlineKeyboardButton(text="👥 Foydalanuvchilar", callback_data="admin_users")],
-        [InlineKeyboardButton(text="📢 Broadcast", callback_data="admin_broadcast"),
-         InlineKeyboardButton(text="🔴 Botni o'chir" if bot_enabled else "🟢 Botni yoq", callback_data="admin_toggle")],
+        [InlineKeyboardButton(text="⏳ Kutayotganlar", callback_data="admin_pending"),
+         InlineKeyboardButton(text="📢 Broadcast", callback_data="admin_broadcast")],
+        [InlineKeyboardButton(text="🔴 Botni o'chir" if bot_enabled else "🟢 Botni yoq", callback_data="admin_toggle")],
     ])
 
 
@@ -648,6 +688,24 @@ async def admin_callback(callback: CallbackQuery):
         text = await asyncio.to_thread(db_admin_users)
         await callback.message.edit_text(text, reply_markup=admin_keyboard())
 
+    elif action == "admin_pending":
+        rows = await asyncio.to_thread(db_pending_users)
+        if not rows:
+            await callback.message.edit_text("Kutayotgan foydalanuvchilar yo'q.", reply_markup=admin_keyboard())
+        else:
+            buttons = []
+            for r in rows:
+                name = f"@{r['username']}" if r['username'] else r['full_name']
+                buttons.append([
+                    InlineKeyboardButton(text=f"✅ {name}", callback_data=f"approve_{r['user_id']}"),
+                    InlineKeyboardButton(text="❌", callback_data=f"revoke_{r['user_id']}"),
+                ])
+            buttons.append([InlineKeyboardButton(text="⬅️ Orqaga", callback_data="admin_back")])
+            await callback.message.edit_text(
+                "⏳ Ruxsat kutayotganlar:",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
+            )
+
     elif action == "admin_toggle":
         bot_enabled = not bot_enabled
         status = "🟢 Bot yoqildi!" if bot_enabled else "🔴 Bot o'chirildi!"
@@ -659,7 +717,72 @@ async def admin_callback(callback: CallbackQuery):
             reply_markup=admin_keyboard()
         )
 
+    elif action == "admin_back":
+        await callback.message.edit_text("🛠 Admin panel:", reply_markup=admin_keyboard())
+
+    elif action.startswith("approve_"):
+        uid = int(action.split("_")[1])
+        ok = await asyncio.to_thread(db_approve_user, uid)
+        if ok:
+            try:
+                await callback.bot.send_message(uid, "✅ Botdan foydalanishga ruxsat berildi! Xush kelibsiz!")
+            except Exception:
+                pass
+        await callback.answer("✅ Ruxsat berildi!" if ok else "Foydalanuvchi topilmadi")
+        rows = await asyncio.to_thread(db_pending_users)
+        if not rows:
+            await callback.message.edit_text("Kutayotgan foydalanuvchilar yo'q.", reply_markup=admin_keyboard())
+        else:
+            buttons = []
+            for r in rows:
+                name = f"@{r['username']}" if r['username'] else r['full_name']
+                buttons.append([
+                    InlineKeyboardButton(text=f"✅ {name}", callback_data=f"approve_{r['user_id']}"),
+                    InlineKeyboardButton(text="❌", callback_data=f"revoke_{r['user_id']}"),
+                ])
+            buttons.append([InlineKeyboardButton(text="⬅️ Orqaga", callback_data="admin_back")])
+            await callback.message.edit_text("⏳ Ruxsat kutayotganlar:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+        return
+
+    elif action.startswith("revoke_"):
+        uid = int(action.split("_")[1])
+        await asyncio.to_thread(db_revoke_user, uid)
+        await callback.answer("❌ Rad etildi")
+
     await callback.answer()
+
+
+@router.message(Command("approve"))
+async def cmd_approve(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    parts = message.text.split()
+    if len(parts) < 2:
+        await message.answer("Foydalanish: /approve <user_id>")
+        return
+    uid = int(parts[1])
+    ok = await asyncio.to_thread(db_approve_user, uid)
+    if ok:
+        try:
+            await message.bot.send_message(uid, "✅ Botdan foydalanishga ruxsat berildi! /start bosing.")
+        except Exception:
+            pass
+        await message.answer(f"✅ {uid} ruxsat berildi.")
+    else:
+        await message.answer("Foydalanuvchi topilmadi.")
+
+
+@router.message(Command("revoke"))
+async def cmd_revoke(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    parts = message.text.split()
+    if len(parts) < 2:
+        await message.answer("Foydalanish: /revoke <user_id>")
+        return
+    uid = int(parts[1])
+    await asyncio.to_thread(db_revoke_user, uid)
+    await message.answer(f"❌ {uid} ruxsati olib tashlandi.")
 
 
 @router.message(Command("broadcast"))
@@ -683,10 +806,29 @@ async def cmd_broadcast(message: Message, bot: Bot):
 
 @router.message(CommandStart())
 async def cmd_start(message: Message):
-    await asyncio.to_thread(
-        db_track_user, message.from_user.id,
-        message.from_user.username, message.from_user.full_name
-    )
+    uid = message.from_user.id
+    await asyncio.to_thread(db_track_user, uid, message.from_user.username, message.from_user.full_name)
+
+    if not await asyncio.to_thread(db_is_approved, uid):
+        # Adminga xabar yuboramiz
+        if ADMIN_ID and BOT:
+            name = f"@{message.from_user.username}" if message.from_user.username else message.from_user.full_name
+            try:
+                await BOT.send_message(
+                    ADMIN_ID,
+                    f"🔔 Yangi foydalanuvchi botdan foydalanmoqchi:\n"
+                    f"👤 {name} (ID: {uid})\n\n"
+                    f"Ruxsat berish uchun: /approve {uid}\nRad etish: /revoke {uid}"
+                )
+            except Exception:
+                pass
+        await message.answer(
+            "Salom! 👋\n\n"
+            "Botdan foydalanish uchun admin ruxsati kerak.\n"
+            "So'rovingiz adminga yuborildi — tez orada javob olasiz! ⏳"
+        )
+        return
+
     await message.answer(
         "Salom! 👋 Men sizning shaxsiy yordamchingizman.\n\n"
         "🔎 Internetdan ma'lumot — \"Dollar kursi qancha?\"\n"
@@ -736,10 +878,14 @@ async def transcribe_audio(data: bytes, mime: str) -> str:
 
 @router.message(F.voice | F.audio)
 async def handle_voice(message: Message, bot: Bot):
-    if not bot_enabled and message.from_user.id != ADMIN_ID:
+    uid = message.from_user.id
+    if not bot_enabled and uid != ADMIN_ID:
         await message.answer("Bot vaqtincha o'chirilgan. Tez orada qaytamiz!")
         return
-    await asyncio.to_thread(db_track_user, message.from_user.id, message.from_user.username, message.from_user.full_name)
+    if not await asyncio.to_thread(db_is_approved, uid):
+        await message.answer("Botdan foydalanish uchun admin ruxsati kerak. /start bosing.")
+        return
+    await asyncio.to_thread(db_track_user, uid, message.from_user.username, message.from_user.full_name)
     await bot.send_chat_action(message.chat.id, ChatAction.TYPING)
     try:
         audio = message.voice or message.audio
@@ -766,10 +912,14 @@ async def handle_voice(message: Message, bot: Bot):
 
 @router.message(F.photo)
 async def handle_photo(message: Message, bot: Bot):
-    if not bot_enabled and message.from_user.id != ADMIN_ID:
+    uid = message.from_user.id
+    if not bot_enabled and uid != ADMIN_ID:
         await message.answer("Bot vaqtincha o'chirilgan. Tez orada qaytamiz!")
         return
-    await asyncio.to_thread(db_track_user, message.from_user.id, message.from_user.username, message.from_user.full_name)
+    if not await asyncio.to_thread(db_is_approved, uid):
+        await message.answer("Botdan foydalanish uchun admin ruxsati kerak. /start bosing.")
+        return
+    await asyncio.to_thread(db_track_user, uid, message.from_user.username, message.from_user.full_name)
     await bot.send_chat_action(message.chat.id, ChatAction.TYPING)
     try:
         photo = message.photo[-1]  # eng katta o'lcham
@@ -798,10 +948,14 @@ async def handle_photo(message: Message, bot: Bot):
 
 @router.message(F.text)
 async def handle_text(message: Message, bot: Bot):
-    if not bot_enabled and message.from_user.id != ADMIN_ID:
+    uid = message.from_user.id
+    if not bot_enabled and uid != ADMIN_ID:
         await message.answer("Bot vaqtincha o'chirilgan. Tez orada qaytamiz!")
         return
-    await asyncio.to_thread(db_track_user, message.from_user.id, message.from_user.username, message.from_user.full_name)
+    if not await asyncio.to_thread(db_is_approved, uid):
+        await message.answer("Botdan foydalanish uchun admin ruxsati kerak. /start bosing.")
+        return
+    await asyncio.to_thread(db_track_user, uid, message.from_user.username, message.from_user.full_name)
     await bot.send_chat_action(message.chat.id, ChatAction.TYPING)
     try:
         await send_long(message, await ask_agent(message.from_user.id, [types.Part.from_text(text=message.text)]))
