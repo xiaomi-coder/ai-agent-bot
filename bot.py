@@ -640,6 +640,49 @@ def do_get_weather(location: str, when: str = "bugun") -> str:
 
 
 # ============================================================
+# KRIPTO NARXI (CoinGecko — bepul, kalitsiz, real-time)
+# ============================================================
+
+def do_get_crypto(coin: str) -> str:
+    try:
+        # Nomdan coin id ni aniqlash
+        search = requests.get(
+            "https://api.coingecko.com/api/v3/search",
+            params={"query": coin}, timeout=10,
+        ).json()
+        coins = search.get("coins", [])
+        if not coins:
+            return f"'{coin}' kriptovalyutasi topilmadi."
+        coin_id = coins[0]["id"]
+        symbol = coins[0]["symbol"].upper()
+        name = coins[0]["name"]
+
+        price = requests.get(
+            "https://api.coingecko.com/api/v3/simple/price",
+            params={
+                "ids": coin_id,
+                "vs_currencies": "usd",
+                "include_24hr_change": "true",
+            },
+            timeout=10,
+        ).json()
+        d = price.get(coin_id, {})
+        usd = d.get("usd")
+        change = d.get("usd_24h_change", 0)
+        if usd is None:
+            return f"{name} narxi topilmadi."
+        arrow = "📈" if change >= 0 else "📉"
+        return (
+            f"💰 {name} ({symbol}):\n"
+            f"Narx: ${usd:,.2f}\n"
+            f"24 soat: {arrow} {change:+.2f}%"
+        )
+    except Exception as e:
+        logger.exception("Kripto narx xato")
+        return f"Kripto narxini olishda xatolik: {e}"
+
+
+# ============================================================
 # GEMINI FUNCTION CALLING
 # ============================================================
 
@@ -663,6 +706,17 @@ FUNCTION_DECLARATIONS = [
                 "when": types.Schema(type=types.Type.STRING, enum=["bugun", "ertaga", "indinga"], description="Qaysi kun"),
             },
             required=["location"],
+        ),
+    ),
+    types.FunctionDeclaration(
+        name="get_crypto",
+        description="Kriptovalyuta narxini real-time olish (Bitcoin, Ethereum, Toncoin va boshqalar). 'Bitcoin narxi qancha' kabi savollarda web_search EMAS, SHUNI ishlat.",
+        parameters=types.Schema(
+            type=types.Type.OBJECT,
+            properties={
+                "coin": types.Schema(type=types.Type.STRING, description="Kripto nomi (masalan: bitcoin, ethereum, ton, solana)"),
+            },
+            required=["coin"],
         ),
     ),
     types.FunctionDeclaration(
@@ -780,6 +834,7 @@ HOZIRGI VAQT: {now.strftime('%Y-%m-%d %H:%M')}, {weekdays[now.weekday()]} (Asia/
 Imkoniyatlaring:
 1. Internet qidiruv (web_search) — yangi ma'lumot kerak bo'lsa taxmin qilma, qidir! O'zbekistonga oid odam/joy bo'lsa qidiruvga "O'zbekiston" qo'sh.
 2. Ob-havo (get_weather) — ob-havo so'ralsa SHU funksiyani ishlat, web_search EMAS. Joy aytilmasa, profildagi joyni yoki "Toshkent" ni ol.
+   Kripto narxi (get_crypto) — Bitcoin/Ethereum kabi narxlar so'ralsa SHU funksiyani ishlat, web_search EMAS (real-time aniq narx).
 3. Buxgalteriya — xarajat/daromad aytilsa add_transaction. Hisobot so'ralsa get_report.
 4. Eslatmalar — set_reminder (vaqtni aniq 'YYYY-MM-DD HH:MM' ga aylantir).
 5. Qaydlar — "eslab qol" desa add_note, "nima edi?" desa find_notes.
@@ -801,6 +856,8 @@ def execute_function(user_id: int, name: str, args: dict) -> str:
             return do_web_search(args.get("query", ""))
         if name == "get_weather":
             return do_get_weather(args.get("location", "Toshkent"), args.get("when", "bugun"))
+        if name == "get_crypto":
+            return do_get_crypto(args.get("coin", "bitcoin"))
         if name == "add_transaction":
             return db_add_transaction(
                 user_id, args.get("tx_type", "chiqim"), float(args.get("amount", 0)),
