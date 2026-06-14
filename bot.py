@@ -497,9 +497,13 @@ async def ask_agent(user_id: int, user_parts: list[types.Part]) -> str:
         if not response.candidates:
             return "Kechirasiz, javob topa olmadim (model blok qildi)."
         candidate = response.candidates[0]
-        if not candidate.content or not candidate.content.parts:
-            return (response.text or "").strip() or "Kechirasiz, javob topa olmadim."
-        function_calls = [p.function_call for p in candidate.content.parts if p.function_call]
+        parts = (candidate.content.parts or []) if candidate.content else []
+        if not parts:
+            try:
+                return (response.text or "").strip() or "Kechirasiz, javob topa olmadim."
+            except Exception:
+                return "Kechirasiz, javob topa olmadim."
+        function_calls = [p.function_call for p in parts if p.function_call]
 
         if not function_calls:
             try:
