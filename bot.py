@@ -307,7 +307,15 @@ def do_web_search(query: str) -> str:
                 tools=[types.Tool(google_search=types.GoogleSearch())],
             ),
         )
-        return (response.text or "").strip() or "Ma'lumot topilmadi."
+        if not response.candidates:
+            return "Qidiruv natijasi topilmadi."
+        try:
+            text = (response.text or "").strip()
+        except Exception:
+            # grounding metadata bor, text yo'q — parts dan qidiramiz
+            parts = response.candidates[0].content.parts if response.candidates[0].content else []
+            text = " ".join(p.text for p in parts if p.text).strip()
+        return text or "Ma'lumot topilmadi."
     except Exception as e:
         logger.exception("Qidiruvda xato")
         return f"Qidiruvda xatolik: {e}"
@@ -486,11 +494,18 @@ async def ask_agent(user_id: int, user_parts: list[types.Part]) -> str:
         response = await asyncio.to_thread(
             client.models.generate_content, model=MODEL, contents=contents, config=config,
         )
+        if not response.candidates:
+            return "Kechirasiz, javob topa olmadim (model blok qildi)."
         candidate = response.candidates[0]
+        if not candidate.content or not candidate.content.parts:
+            return (response.text or "").strip() or "Kechirasiz, javob topa olmadim."
         function_calls = [p.function_call for p in candidate.content.parts if p.function_call]
 
         if not function_calls:
-            answer = (response.text or "").strip() or "Kechirasiz, javob topa olmadim."
+            try:
+                answer = (response.text or "").strip() or "Kechirasiz, javob topa olmadim."
+            except Exception:
+                answer = "Kechirasiz, javob topa olmadim."
             saved = [p if p.text else types.Part.from_text(text="[media xabar]") for p in user_parts]
             history.append(types.Content(role="user", parts=saved))
             history.append(types.Content(role="model", parts=[types.Part.from_text(text=answer)]))
