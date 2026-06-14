@@ -894,6 +894,16 @@ chat_history: dict[int, list[types.Content]] = {}
 onboarding_state: dict[int, dict] = {}  # {user_id: {step, name, profession, interests, goals}}
 
 
+def _save_history(user_id: int, user_parts: list[types.Part], answer: str):
+    """Foydalanuvchi xabari va javobni tarixga saqlaydi (kontekst saqlanishi uchun)."""
+    history = chat_history.setdefault(user_id, [])
+    saved = [p if p.text else types.Part.from_text(text="[media xabar]") for p in user_parts]
+    history.append(types.Content(role="user", parts=saved))
+    history.append(types.Content(role="model", parts=[types.Part.from_text(text=answer)]))
+    if len(history) > MAX_HISTORY * 2:
+        chat_history[user_id] = history[-MAX_HISTORY * 2:]
+
+
 async def ask_agent(user_id: int, user_parts: list[types.Part]) -> str:
     history = chat_history.setdefault(user_id, [])
     contents = history + [types.Content(role="user", parts=user_parts)]
@@ -904,32 +914,33 @@ async def ask_agent(user_id: int, user_parts: list[types.Part]) -> str:
         tools=[types.Tool(function_declarations=FUNCTION_DECLARATIONS)],
     )
 
-    for _ in range(5):
+    answer = "Kechirasiz, javob topa olmadim. Boshqacharoq so'rab ko'ring."
+    for _ in range(6):
         response = await asyncio.to_thread(
             client.models.generate_content, model=MODEL, contents=contents, config=config,
         )
         if not response.candidates:
-            return "Kechirasiz, javob topa olmadim (model blok qildi)."
+            break
         candidate = response.candidates[0]
         parts = (candidate.content.parts or []) if candidate.content else []
         if not parts:
             try:
-                return (response.text or "").strip() or "Kechirasiz, javob topa olmadim."
+                txt = (response.text or "").strip()
             except Exception:
-                return "Kechirasiz, javob topa olmadim."
-        function_calls = [p.function_call for p in parts if p.function_call]
+                txt = ""
+            if txt:
+                answer = txt
+            break
 
+        function_calls = [p.function_call for p in parts if p.function_call]
         if not function_calls:
             try:
-                answer = (response.text or "").strip() or "Kechirasiz, javob topa olmadim."
+                txt = (response.text or "").strip()
             except Exception:
-                answer = "Kechirasiz, javob topa olmadim."
-            saved = [p if p.text else types.Part.from_text(text="[media xabar]") for p in user_parts]
-            history.append(types.Content(role="user", parts=saved))
-            history.append(types.Content(role="model", parts=[types.Part.from_text(text=answer)]))
-            if len(history) > MAX_HISTORY * 2:
-                chat_history[user_id] = history[-MAX_HISTORY * 2:]
-            return answer
+                txt = ""
+            if txt:
+                answer = txt
+            break
 
         contents.append(candidate.content)
         result_parts = []
@@ -938,7 +949,9 @@ async def ask_agent(user_id: int, user_parts: list[types.Part]) -> str:
             result_parts.append(types.Part.from_function_response(name=fc.name, response={"result": result}))
         contents.append(types.Content(role="user", parts=result_parts))
 
-    return "So'rov juda murakkab bo'lib ketdi, soddaroq qilib qaytadan so'rang."
+    # Har qanday holatda ham kontekstni saqlaymiz
+    _save_history(user_id, user_parts, answer)
+    return answer
 
 
 # ============================================================
