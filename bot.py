@@ -18,9 +18,11 @@ import asyncio
 import io
 import logging
 import os
-import sqlite3
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
+
+import psycopg2
+from psycopg2.extras import RealDictCursor
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.enums import ChatAction
@@ -36,11 +38,13 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
-DB_PATH = os.getenv("DB_PATH", "assistant.db")
+DATABASE_URL = os.getenv("DATABASE_URL")
 TZ = ZoneInfo(os.getenv("TZ", "Asia/Tashkent"))
 
 if not BOT_TOKEN or not GEMINI_API_KEY:
     raise SystemExit("Xato: .env faylda BOT_TOKEN va GEMINI_API_KEY bo'lishi shart!")
+if not DATABASE_URL:
+    raise SystemExit("Xato: DATABASE_URL bo'lishi shart!")
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ai-assistant")
@@ -55,49 +59,55 @@ def now_local() -> datetime:
 
 
 # ============================================================
-# BAZA (SQLite)
+# BAZA (PostgreSQL)
 # ============================================================
 
+def get_conn():
+    return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+
+
 def db_init():
-    with sqlite3.connect(DB_PATH) as db:
-        db.execute("""
-            CREATE TABLE IF NOT EXISTS transactions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                type TEXT NOT NULL CHECK(type IN ('kirim', 'chiqim')),
-                amount REAL NOT NULL,
-                category TEXT NOT NULL,
-                note TEXT,
-                created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
-            )
-        """)
-        db.execute("""
-            CREATE TABLE IF NOT EXISTS reminders (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                text TEXT NOT NULL,
-                remind_at TEXT NOT NULL,
-                sent INTEGER NOT NULL DEFAULT 0
-            )
-        """)
-        db.execute("""
-            CREATE TABLE IF NOT EXISTS notes (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                text TEXT NOT NULL,
-                created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
-            )
-        """)
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS transactions (
+                    id SERIAL PRIMARY KEY,
+                    user_id BIGINT NOT NULL,
+                    type TEXT NOT NULL CHECK(type IN ('kirim', 'chiqim')),
+                    amount REAL NOT NULL,
+                    category TEXT NOT NULL,
+                    note TEXT,
+                    created_at TIMESTAMP NOT NULL DEFAULT NOW()
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS reminders (
+                    id SERIAL PRIMARY KEY,
+                    user_id BIGINT NOT NULL,
+                    text TEXT NOT NULL,
+                    remind_at TEXT NOT NULL,
+                    sent INTEGER NOT NULL DEFAULT 0
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS notes (
+                    id SERIAL PRIMARY KEY,
+                    user_id BIGINT NOT NULL,
+                    text TEXT NOT NULL,
+                    created_at TIMESTAMP NOT NULL DEFAULT NOW()
+                )
+            """)
 
 
 # --- Buxgalteriya ---
 
 def db_add_transaction(user_id: int, tx_type: str, amount: float, category: str, note: str) -> str:
-    with sqlite3.connect(DB_PATH) as db:
-        db.execute(
-            "INSERT INTO transactions (user_id, type, amount, category, note) VALUES (?, ?, ?, ?, ?)",
-            (user_id, tx_type, amount, category, note),
-        )
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO transactions (user_id, type, amount, category, note) VALUES (%s, %s, %s, %s, %s)",
+                (user_id, tx_type, amount, category, note),
+            )
     return f"Yozildi: {tx_type} {amount:,.0f} so'm, kategoriya: {category}" + (f" ({note})" if note else "")
 
 
@@ -110,22 +120,25 @@ def db_get_report(user_id: int, period: str) -> str:
     else:
         start = now - timedelta(days=30)
 
-    with sqlite3.connect(DB_PATH) as db:
-        rows = db.execute(
-            """SELECT type, category, SUM(amount), COUNT(*)
-               FROM transactions
-               WHERE user_id = ? AND created_at >= ?
-               GROUP BY type, category
-               ORDER BY type, SUM(amount) DESC""",
-            (user_id, start.strftime("%Y-%m-%d %H:%M:%S")),
-        ).fetchall()
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT type, category, SUM(amount), COUNT(*)
+                   FROM transactions
+                   WHERE user_id = %s AND created_at >= %s
+                   GROUP BY type, category
+                   ORDER BY type, SUM(amount) DESC""",
+                (user_id, start),
+            )
+            rows = cur.fetchall()
 
     if not rows:
         return f"Bu davr ({period}) uchun yozuvlar topilmadi."
 
     kirim_total, chiqim_total = 0.0, 0.0
     lines = [f"Hisobot ({period}):"]
-    for tx_type, category, total, count in rows:
+    for row in rows:
+        tx_type, category, total, count = row["type"], row["category"], row["sum"], row["count"]
         lines.append(f"- {tx_type} | {category}: {total:,.0f} so'm ({count} ta)")
         if tx_type == "kirim":
             kirim_total += total
@@ -138,15 +151,17 @@ def db_get_report(user_id: int, period: str) -> str:
 
 
 def db_delete_last(user_id: int) -> str:
-    with sqlite3.connect(DB_PATH) as db:
-        row = db.execute(
-            "SELECT id, type, amount, category FROM transactions WHERE user_id = ? ORDER BY id DESC LIMIT 1",
-            (user_id,),
-        ).fetchone()
-        if not row:
-            return "O'chiradigan yozuv yo'q."
-        db.execute("DELETE FROM transactions WHERE id = ?", (row[0],))
-    return f"O'chirildi: {row[1]} {row[2]:,.0f} so'm ({row[3]})"
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, type, amount, category FROM transactions WHERE user_id = %s ORDER BY id DESC LIMIT 1",
+                (user_id,),
+            )
+            row = cur.fetchone()
+            if not row:
+                return "O'chiradigan yozuv yo'q."
+            cur.execute("DELETE FROM transactions WHERE id = %s", (row["id"],))
+    return f"O'chirildi: {row['type']} {row['amount']:,.0f} so'm ({row['category']})"
 
 
 # --- Eslatmalar ---
@@ -179,35 +194,40 @@ def db_set_reminder(user_id: int, text: str, remind_at_str: str) -> str:
     if remind_at <= now_local():
         return "Bu vaqt o'tib ketgan. Kelajakdagi vaqtni ayting."
 
-    with sqlite3.connect(DB_PATH) as db:
-        cur = db.execute(
-            "INSERT INTO reminders (user_id, text, remind_at) VALUES (?, ?, ?)",
-            (user_id, text, remind_at.strftime("%Y-%m-%d %H:%M")),
-        )
-        reminder_id = cur.lastrowid
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO reminders (user_id, text, remind_at) VALUES (%s, %s, %s) RETURNING id",
+                (user_id, text, remind_at.strftime("%Y-%m-%d %H:%M")),
+            )
+            reminder_id = cur.fetchone()["id"]
 
     schedule_reminder(reminder_id, user_id, text, remind_at)
     return f"Eslatma o'rnatildi: \"{text}\" — {remind_at.strftime('%d.%m.%Y soat %H:%M')} (№{reminder_id})"
 
 
 def db_list_reminders(user_id: int) -> str:
-    with sqlite3.connect(DB_PATH) as db:
-        rows = db.execute(
-            "SELECT id, text, remind_at FROM reminders WHERE user_id = ? AND sent = 0 ORDER BY remind_at",
-            (user_id,),
-        ).fetchall()
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, text, remind_at FROM reminders WHERE user_id = %s AND sent = 0 ORDER BY remind_at",
+                (user_id,),
+            )
+            rows = cur.fetchall()
     if not rows:
         return "Faol eslatmalar yo'q."
-    return "Faol eslatmalar:\n" + "\n".join(f"№{r[0]}: {r[1]} — {r[2]}" for r in rows)
+    return "Faol eslatmalar:\n" + "\n".join(f"№{r['id']}: {r['text']} — {r['remind_at']}" for r in rows)
 
 
 def db_delete_reminder(user_id: int, reminder_id: int) -> str:
-    with sqlite3.connect(DB_PATH) as db:
-        cur = db.execute(
-            "DELETE FROM reminders WHERE id = ? AND user_id = ? AND sent = 0",
-            (reminder_id, user_id),
-        )
-    if cur.rowcount == 0:
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM reminders WHERE id = %s AND user_id = %s AND sent = 0",
+                (reminder_id, user_id),
+            )
+            deleted = cur.rowcount
+    if deleted == 0:
         return f"№{reminder_id} eslatma topilmadi."
     try:
         scheduler.remove_job(f"rem_{reminder_id}")
@@ -219,14 +239,16 @@ def db_delete_reminder(user_id: int, reminder_id: int) -> str:
 def restore_reminders():
     """Server qayta yonsa — bazadagi eslatmalarni qayta yuklaymiz."""
     now = now_local()
-    with sqlite3.connect(DB_PATH) as db:
-        rows = db.execute("SELECT id, user_id, text, remind_at FROM reminders WHERE sent = 0").fetchall()
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id, user_id, text, remind_at FROM reminders WHERE sent = 0")
+            rows = cur.fetchall()
     restored = 0
-    for rid, uid, text, remind_at_str in rows:
-        remind_at = datetime.strptime(remind_at_str, "%Y-%m-%d %H:%M").replace(tzinfo=TZ)
+    for row in rows:
+        remind_at = datetime.strptime(row["remind_at"], "%Y-%m-%d %H:%M").replace(tzinfo=TZ)
         if remind_at <= now:
-            remind_at = now + timedelta(seconds=10)  # o'tib ketgan — darhol yuboramiz
-        schedule_reminder(rid, uid, text, remind_at)
+            remind_at = now + timedelta(seconds=10)
+        schedule_reminder(row["id"], row["user_id"], row["text"], remind_at)
         restored += 1
     if restored:
         logger.info("%d ta eslatma qayta yuklandi", restored)
@@ -235,32 +257,41 @@ def restore_reminders():
 # --- Qaydlar ---
 
 def db_add_note(user_id: int, text: str) -> str:
-    with sqlite3.connect(DB_PATH) as db:
-        cur = db.execute("INSERT INTO notes (user_id, text) VALUES (?, ?)", (user_id, text))
-    return f"Eslab qoldim (№{cur.lastrowid}): {text}"
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO notes (user_id, text) VALUES (%s, %s) RETURNING id",
+                (user_id, text),
+            )
+            note_id = cur.fetchone()["id"]
+    return f"Eslab qoldim (№{note_id}): {text}"
 
 
 def db_find_notes(user_id: int, query: str) -> str:
-    with sqlite3.connect(DB_PATH) as db:
-        if query:
-            rows = db.execute(
-                "SELECT id, text, created_at FROM notes WHERE user_id = ? AND text LIKE ? ORDER BY id DESC LIMIT 10",
-                (user_id, f"%{query}%"),
-            ).fetchall()
-        else:
-            rows = db.execute(
-                "SELECT id, text, created_at FROM notes WHERE user_id = ? ORDER BY id DESC LIMIT 10",
-                (user_id,),
-            ).fetchall()
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            if query:
+                cur.execute(
+                    "SELECT id, text, created_at FROM notes WHERE user_id = %s AND text ILIKE %s ORDER BY id DESC LIMIT 10",
+                    (user_id, f"%{query}%"),
+                )
+            else:
+                cur.execute(
+                    "SELECT id, text, created_at FROM notes WHERE user_id = %s ORDER BY id DESC LIMIT 10",
+                    (user_id,),
+                )
+            rows = cur.fetchall()
     if not rows:
         return "Qaydlar topilmadi." if query else "Hali qaydlar yo'q."
-    return "Topilgan qaydlar:\n" + "\n".join(f"№{r[0]} ({r[2][:10]}): {r[1]}" for r in rows)
+    return "Topilgan qaydlar:\n" + "\n".join(f"№{r['id']} ({str(r['created_at'])[:10]}): {r['text']}" for r in rows)
 
 
 def db_delete_note(user_id: int, note_id: int) -> str:
-    with sqlite3.connect(DB_PATH) as db:
-        cur = db.execute("DELETE FROM notes WHERE id = ? AND user_id = ?", (note_id, user_id))
-    return f"№{note_id} qayd o'chirildi." if cur.rowcount else f"№{note_id} qayd topilmadi."
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM notes WHERE id = %s AND user_id = %s", (note_id, user_id))
+            deleted = cur.rowcount
+    return f"№{note_id} qayd o'chirildi." if deleted else f"№{note_id} qayd topilmadi."
 
 
 # ============================================================
