@@ -113,9 +113,25 @@ def db_init():
                     approved BOOLEAN NOT NULL DEFAULT FALSE
                 )
             """)
-            # Eski bazada approved column bo'lmasa qo'shamiz
+            cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS approved BOOLEAN NOT NULL DEFAULT FALSE")
             cur.execute("""
-                ALTER TABLE users ADD COLUMN IF NOT EXISTS approved BOOLEAN NOT NULL DEFAULT FALSE
+                CREATE TABLE IF NOT EXISTS profiles (
+                    user_id BIGINT PRIMARY KEY,
+                    name TEXT,
+                    profession TEXT,
+                    interests TEXT,
+                    language TEXT DEFAULT 'uz',
+                    goals TEXT,
+                    onboarded BOOLEAN NOT NULL DEFAULT FALSE
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS long_memory (
+                    id SERIAL PRIMARY KEY,
+                    user_id BIGINT NOT NULL,
+                    summary TEXT NOT NULL,
+                    created_at TIMESTAMP NOT NULL DEFAULT NOW()
+                )
             """)
 
 
@@ -412,6 +428,65 @@ def db_pending_users() -> list[dict]:
             return cur.fetchall()
 
 
+# --- Profil ---
+
+def db_get_profile(user_id: int) -> dict | None:
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM profiles WHERE user_id = %s", (user_id,))
+            return cur.fetchone()
+
+
+def db_save_profile(user_id: int, name: str, profession: str, interests: str, goals: str, language: str = "uz"):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO profiles (user_id, name, profession, interests, goals, language, onboarded)
+                VALUES (%s, %s, %s, %s, %s, %s, TRUE)
+                ON CONFLICT (user_id) DO UPDATE SET
+                    name = EXCLUDED.name,
+                    profession = EXCLUDED.profession,
+                    interests = EXCLUDED.interests,
+                    goals = EXCLUDED.goals,
+                    language = EXCLUDED.language,
+                    onboarded = TRUE
+            """, (user_id, name, profession, interests, goals, language))
+
+
+def db_is_onboarded(user_id: int) -> bool:
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT onboarded FROM profiles WHERE user_id = %s", (user_id,))
+            row = cur.fetchone()
+            return bool(row and row["onboarded"])
+
+
+def db_add_memory(user_id: int, summary: str):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO long_memory (user_id, summary) VALUES (%s, %s)",
+                (user_id, summary)
+            )
+            # Faqat oxirgi 10 ta xotirani saqlaymiz
+            cur.execute("""
+                DELETE FROM long_memory WHERE user_id = %s AND id NOT IN (
+                    SELECT id FROM long_memory WHERE user_id = %s ORDER BY id DESC LIMIT 10
+                )
+            """, (user_id, user_id))
+
+
+def db_get_memory(user_id: int) -> str:
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT summary FROM long_memory WHERE user_id = %s ORDER BY id DESC LIMIT 10",
+                (user_id,)
+            )
+            rows = cur.fetchall()
+    return "\n".join(r["summary"] for r in reversed(rows)) if rows else ""
+
+
 # ============================================================
 # INTERNET QIDIRUV
 # ============================================================
@@ -536,10 +611,29 @@ FUNCTION_DECLARATIONS = [
 ]
 
 
-def build_system_prompt() -> str:
+def build_system_prompt(user_id: int | None = None) -> str:
     now = now_local()
     weekdays = ["Dushanba", "Seshanba", "Chorshanba", "Payshanba", "Juma", "Shanba", "Yakshanba"]
-    return f"""Sen Buxorolik dasturchi tomonidan yaratilgan shaxsiy AI agentsan. Telegram botda ishlaysan.
+
+    profile_section = ""
+    memory_section = ""
+    if user_id:
+        profile = db_get_profile(user_id)
+        if profile:
+            profile_section = f"""
+FOYDALANUVCHI PROFILI:
+- Ismi: {profile['name']}
+- Kasbi: {profile['profession']}
+- Qiziqishlari: {profile['interests']}
+- Maqsadlari: {profile['goals']}
+- Tili: {profile['language']}
+Foydalanuvchiga doim ismi bilan murojaat qil. Kasbiga mos maslahatlar ber."""
+
+        memory = db_get_memory(user_id)
+        if memory:
+            memory_section = f"\nOLDINGI SUHBATLARDAN XOTIRA:\n{memory}"
+
+    return f"""Sen Buxorolik dasturchi tomonidan yaratilgan shaxsiy AI agentsan. Sirdosh deb ataladigan Telegram botda ishlaysan.
 Agar "sen kimsan", "sen nimasan", "kim yaratdi", "qaysi model", "qaysi AI" kabi savollar berilsa — "Men Buxorolik dasturchi tomonidan yaratilgan shaxsiy AI agentman 😊" deb javob ber. Hech qachon Google yoki boshqa kompaniya nomini aytma.
 Sen ovozli xabarlarni ham qabul qila olasan va tushunasan. Foydalanuvchi ovoz yuborsa, uni tushunib javob berasan.
 
@@ -558,6 +652,7 @@ Qoidalar:
 - Javoblar qisqa va aniq.
 - Summalar: "50 ming" = 50000, "1.5 mln" = 1500000.
 - Funksiya natijasini chiroyli, tushunarli qilib yetkaz.
+{profile_section}{memory_section}
 """
 
 
@@ -598,6 +693,7 @@ def execute_function(user_id: int, name: str, args: dict) -> str:
 
 MAX_HISTORY = 20
 chat_history: dict[int, list[types.Content]] = {}
+onboarding_state: dict[int, dict] = {}  # {user_id: {step, name, profession, interests, goals}}
 
 
 async def ask_agent(user_id: int, user_parts: list[types.Part]) -> str:
@@ -605,7 +701,7 @@ async def ask_agent(user_id: int, user_parts: list[types.Part]) -> str:
     contents = history + [types.Content(role="user", parts=user_parts)]
 
     config = types.GenerateContentConfig(
-        system_instruction=build_system_prompt(),
+        system_instruction=build_system_prompt(user_id),
         temperature=0.7,
         tools=[types.Tool(function_declarations=FUNCTION_DECLARATIONS)],
     )
@@ -725,7 +821,7 @@ async def admin_callback(callback: CallbackQuery):
         ok = await asyncio.to_thread(db_approve_user, uid)
         if ok:
             try:
-                await callback.bot.send_message(uid, "✅ Botdan foydalanishga ruxsat berildi! Xush kelibsiz!")
+                await start_onboarding(callback.bot, uid)
             except Exception:
                 pass
         await callback.answer("✅ Ruxsat berildi!" if ok else "Foydalanuvchi topilmadi")
@@ -752,8 +848,20 @@ async def admin_callback(callback: CallbackQuery):
     await callback.answer()
 
 
+async def start_onboarding(bot: Bot, user_id: int):
+    onboarding_state[user_id] = {"step": "name"}
+    await bot.send_message(
+        user_id,
+        "✅ Botdan foydalanishga ruxsat berildi!\n\n"
+        "Salom! 👋 Men sizning shaxsiy *Sirdosh AI* agentingizman.\n\n"
+        "Keling, siz bilan tanishamiz — men sizni yaxshiroq bilsam, ko'proq yordam bera olaman! 😊\n\n"
+        "Avvalo, *ismingiz* nima?",
+        parse_mode="Markdown"
+    )
+
+
 @router.message(Command("approve"))
-async def cmd_approve(message: Message):
+async def cmd_approve(message: Message, bot: Bot):
     if message.from_user.id != ADMIN_ID:
         return
     parts = message.text.split()
@@ -764,7 +872,7 @@ async def cmd_approve(message: Message):
     ok = await asyncio.to_thread(db_approve_user, uid)
     if ok:
         try:
-            await message.bot.send_message(uid, "✅ Botdan foydalanishga ruxsat berildi! /start bosing.")
+            await start_onboarding(bot, uid)
         except Exception:
             pass
         await message.answer(f"✅ {uid} ruxsat berildi.")
@@ -949,6 +1057,65 @@ async def handle_photo(message: Message, bot: Bot):
 @router.message(F.text)
 async def handle_text(message: Message, bot: Bot):
     uid = message.from_user.id
+
+    # Onboarding jarayoni
+    if uid in onboarding_state:
+        state = onboarding_state[uid]
+        text = message.text.strip()
+        step = state["step"]
+
+        if step == "name":
+            state["name"] = text
+            state["step"] = "profession"
+            await message.answer(
+                f"Juda yaxshi, *{text}*! 😊\n\n"
+                "Siz qanday soha bilan shug'ullanasiz?\n"
+                "_(Masalan: dasturchi, tadbirkor, talaba, shifokor...)_",
+                parse_mode="Markdown"
+            )
+
+        elif step == "profession":
+            state["profession"] = text
+            state["step"] = "interests"
+            await message.answer(
+                "Zo'r! 💪\n\n"
+                "Qiziqishlaringiz nima?\n"
+                "_(Masalan: texnologiya, biznes, sport, musiqa, sayohat...)_",
+                parse_mode="Markdown"
+            )
+
+        elif step == "interests":
+            state["interests"] = text
+            state["step"] = "goals"
+            await message.answer(
+                "Ajoyib! 🌟\n\n"
+                "Men sizga eng ko'p qaysi sohada yordam bera olaman?\n"
+                "_(Masalan: ish, o'qish, moliyaviy hisob, eslatmalar, ma'lumot qidirish...)_",
+                parse_mode="Markdown"
+            )
+
+        elif step == "goals":
+            state["goals"] = text
+            await asyncio.to_thread(
+                db_save_profile, uid,
+                state["name"], state["profession"],
+                state["interests"], state["goals"]
+            )
+            del onboarding_state[uid]
+            await message.answer(
+                f"Tanishganimizdan xursandman, *{state['name']}*! 🎉\n\n"
+                f"Men endi siz haqingizda ko'proq bilaman va sizga samarali yordam bera olaman.\n\n"
+                f"📌 Sizning profilingiz:\n"
+                f"👤 Ism: {state['name']}\n"
+                f"💼 Kasb: {state['profession']}\n"
+                f"🎯 Qiziqishlar: {state['interests']}\n"
+                f"🚀 Maqsadlar: {state['goals']}\n\n"
+                f"Endi menga istalgan savolni bering — men doim yordamga tayyorman! 😊\n\n"
+                f"Komandalar: /hisobot, /eslatmalar, /clear",
+                parse_mode="Markdown"
+            )
+        return
+
     if not bot_enabled and uid != ADMIN_ID:
         await message.answer("Bot vaqtincha o'chirilgan. Tez orada qaytamiz!")
         return
