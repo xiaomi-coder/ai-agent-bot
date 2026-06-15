@@ -29,7 +29,7 @@ from aiogram import Bot, Dispatcher, F, Router
 from aiogram.enums import ChatAction
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
-    Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+    Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, BufferedInputFile
 )
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from dotenv import load_dotenv
@@ -652,6 +652,24 @@ def extract_xlsx(data: bytes) -> str:
 
 
 # ============================================================
+# RASM YARATISH (Imagen)
+# ============================================================
+
+def do_generate_image(prompt: str) -> bytes | None:
+    try:
+        result = client.models.generate_images(
+            model="imagen-3.0-generate-002",
+            prompt=prompt,
+            config=types.GenerateImagesConfig(number_of_images=1),
+        )
+        if result.generated_images:
+            return result.generated_images[0].image.image_bytes
+    except Exception:
+        logger.exception("Rasm yaratishda xato")
+    return None
+
+
+# ============================================================
 # OB-HAVO (Open-Meteo — bepul, kalitsiz, aniq)
 # ============================================================
 
@@ -836,6 +854,17 @@ FUNCTION_DECLARATIONS = [
         ),
     ),
     types.FunctionDeclaration(
+        name="generate_image",
+        description="Rasm/surat yaratish. 'Rasm chiz', 'surat yaratib ber', 'menga ... rasmini chiz' desa ishlatiladi. Prompt ingliz tilida va batafsil bo'lsa sifat yuqori bo'ladi.",
+        parameters=types.Schema(
+            type=types.Type.OBJECT,
+            properties={
+                "prompt": types.Schema(type=types.Type.STRING, description="Rasm tavsifi (ingliz tilida, batafsil: uslub, rang, kompozitsiya)"),
+            },
+            required=["prompt"],
+        ),
+    ),
+    types.FunctionDeclaration(
         name="add_transaction",
         description="Kirim yoki chiqimni bazaga yozish. Pul sarflagani/topgani haqida aytsa yoki chek rasmida summa ko'rinsa ishlatiladi.",
         parameters=types.Schema(
@@ -954,6 +983,8 @@ Imkoniyatlaring:
 1. Internet qidiruv (web_search) — yangi ma'lumot kerak bo'lsa taxmin qilma, qidir! O'zbekistonga oid odam/joy bo'lsa qidiruvga "O'zbekiston" qo'sh.
 2. Ob-havo (get_weather) — ob-havo so'ralsa SHU funksiyani ishlat, web_search EMAS. Joy aytilmasa, profildagi joyni yoki "Toshkent" ni ol.
    Kripto narxi (get_crypto) — Bitcoin/Ethereum kabi narxlar so'ralsa SHU funksiyani ishlat, web_search EMAS (real-time aniq narx).
+   Rasm yaratish (generate_image) — "rasm chiz", "surat yaratib ber" desa ishlatiladi. Prompt ni ingliz tilida, batafsil yoz.
+   Hujjat (PDF/Word/Excel) — foydalanuvchi fayl yuborsa avtomatik o'qiysan va tahlil qilasan.
 3. Buxgalteriya — xarajat/daromad aytilsa add_transaction. Hisobot so'ralsa get_report.
 4. Eslatmalar — set_reminder (vaqtni aniq 'YYYY-MM-DD HH:MM' ga aylantir).
 5. Qaydlar — "eslab qol" desa add_note, "nima edi?" desa find_notes.
@@ -1048,7 +1079,7 @@ def _save_history(user_id: int, user_parts: list[types.Part], answer: str):
         chat_history[user_id] = history[-MAX_HISTORY * 2:]
 
 
-async def ask_agent(user_id: int, user_parts: list[types.Part]) -> str:
+async def ask_agent(user_id: int, user_parts: list[types.Part], image_sink: list | None = None) -> str:
     history = chat_history.setdefault(user_id, [])
     contents = history + [types.Content(role="user", parts=user_parts)]
 
@@ -1089,13 +1120,39 @@ async def ask_agent(user_id: int, user_parts: list[types.Part]) -> str:
         contents.append(candidate.content)
         result_parts = []
         for fc in function_calls:
-            result = await asyncio.to_thread(execute_function, user_id, fc.name, dict(fc.args or {}))
+            args = dict(fc.args or {})
+            if fc.name == "generate_image":
+                prompt = args.get("prompt", "")
+                img = await asyncio.to_thread(do_generate_image, prompt)
+                if img is not None and image_sink is not None:
+                    image_sink.append((prompt, img))
+                    result = "Rasm muvaffaqiyatli yaratildi va foydalanuvchiga yuborildi."
+                else:
+                    result = "Rasm yaratib bo'lmadi (xizmat vaqtincha ishlamayapti)."
+            else:
+                result = await asyncio.to_thread(execute_function, user_id, fc.name, args)
             result_parts.append(types.Part.from_function_response(name=fc.name, response={"result": result}))
         contents.append(types.Content(role="user", parts=result_parts))
 
     # Har qanday holatda ham kontekstni saqlaymiz
     _save_history(user_id, user_parts, answer)
     return answer
+
+
+async def agent_respond(message: Message, uid: int, parts: list[types.Part]):
+    """Agentdan javob olib, rasm bo'lsa rasmni, matnni yuboradi."""
+    images: list = []
+    answer = await ask_agent(uid, parts, images)
+    for cap, img in images:
+        try:
+            await message.answer_photo(
+                BufferedInputFile(img, "rasm.png"),
+                caption=(cap[:1000] if cap else None),
+            )
+        except Exception:
+            logger.exception("Rasm yuborishda xato")
+    if answer:
+        await send_long(message, answer)
 
 
 # ============================================================
@@ -1367,7 +1424,7 @@ async def handle_voice(message: Message, bot: Bot):
             return
 
         # Keyin matn sifatida agentga yuboramiz
-        await send_long(message, await ask_agent(message.from_user.id, [types.Part.from_text(text=text)]))
+        await agent_respond(message, message.from_user.id, [types.Part.from_text(text=text)])
     except Exception:
         logger.exception("Golosli xabarda xato")
         await message.answer("Xatolik yuz berdi 😕 Qaytadan urinib ko'ring.")
@@ -1403,7 +1460,7 @@ async def handle_photo(message: Message, bot: Bot):
             types.Part.from_bytes(data=buf.getvalue(), mime_type="image/jpeg"),
             types.Part.from_text(text=instruction),
         ]
-        await send_long(message, await ask_agent(message.from_user.id, parts))
+        await agent_respond(message, message.from_user.id, parts)
     except Exception:
         logger.exception("Rasmda xato")
         await message.answer("Rasmni o'qishda xatolik 😕 Qaytadan urinib ko'ring.")
@@ -1443,7 +1500,7 @@ async def handle_document(message: Message, bot: Bot):
                 types.Part.from_bytes(data=data, mime_type="application/pdf"),
                 types.Part.from_text(text=instruction),
             ]
-            await send_long(message, await ask_agent(uid, parts))
+            await agent_respond(message, uid, parts)
             return
 
         # Word / Excel / matn — matnni ajratamiz
@@ -1466,7 +1523,7 @@ async def handle_document(message: Message, bot: Bot):
 
         text = text[:30000]  # juda katta hujjatlarni cheklash
         prompt = f"{instruction}\n\n=== HUJJAT MAZMUNI ({doc.file_name}) ===\n{text}"
-        await send_long(message, await ask_agent(uid, [types.Part.from_text(text=prompt)]))
+        await agent_respond(message, uid, [types.Part.from_text(text=prompt)])
     except Exception:
         logger.exception("Hujjatda xato")
         await message.answer("Hujjatni o'qishda xatolik 😕 Qaytadan urinib ko'ring.")
@@ -1543,7 +1600,7 @@ async def handle_text(message: Message, bot: Bot):
     await asyncio.to_thread(db_track_user, uid, message.from_user.username, message.from_user.full_name)
     await bot.send_chat_action(message.chat.id, ChatAction.TYPING)
     try:
-        await send_long(message, await ask_agent(message.from_user.id, [types.Part.from_text(text=message.text)]))
+        await agent_respond(message, message.from_user.id, [types.Part.from_text(text=message.text)])
     except Exception:
         logger.exception("Matnli xabarda xato")
         await message.answer("Xatolik yuz berdi 😕 Qaytadan urinib ko'ring.")
