@@ -513,6 +513,13 @@ def db_get_memory(user_id: int) -> str:
     return "\n".join(r["summary"] for r in reversed(rows)) if rows else ""
 
 
+def db_clear_memory(user_id: int) -> int:
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM long_memory WHERE user_id = %s", (user_id,))
+            return cur.rowcount
+
+
 # ============================================================
 # INTERNET QIDIRUV
 # ============================================================
@@ -1010,6 +1017,11 @@ XOTIRA VA G'OYA (eng muhim!):
 - Foydalanuvchining ishini, loyihasini o'rgan va PROAKTIV ravishda foydali G'OYALAR, takliflar ber — so'ramasa ham. Masalan blogger bo'lsa kontent g'oyalari, tadbirkor bo'lsa biznes takliflari.
 - Avvalgi suhbatlardagi xotirani eslab, "o'tgan safar aytgan loyihangiz qanday ketyapti?" kabi tabiiy, g'amxo'r muloqot qil.
 - Sen egangning eng yaqin sirdoshi, maslahatchisi va ilhomchisisan.
+
+FOYDALANUVCHINI TINGLA (juda muhim!):
+- Foydalanuvchi biror narsani "kerakmas", "boshqasini ayt", "bu menga to'g'ri kelmaydi" desa — DARHOL o'sha mavzuni TASHLA va boshqa, YANGI yo'nalishda fikr ber. Eski mavzuni qayta-qayta takrorlama!
+- Uning xohish va e'tirozlarini hurmat qil. Agar bir taklif yoqmasa, butunlay boshqacha variant taklif qil.
+- O'zingdan bitta mavzuga yopishib olma — foydalanuvchi nima xohlayotganini diqqat bilan tingla va shunga moslash.
 {profile_section}{memory_section}
 """
 
@@ -1357,7 +1369,7 @@ async def cmd_start(message: Message):
         "⏰ Eslatma — \"Ertaga 9 da dorini eslatib qo'y\"\n"
         "📝 Qayd — \"Eslab qol: mashina raqami 01A777BB\"\n"
         "🎤 Hammasi golosda ham ishlaydi!\n\n"
-        "Komandalar: /hisobot, /eslatmalar, /clear"
+        "Komandalar: /hisobot, /eslatmalar, /clear, /forget"
     )
 
 
@@ -1375,6 +1387,13 @@ async def cmd_reminders(message: Message):
 async def cmd_clear(message: Message):
     chat_history.pop(message.from_user.id, None)
     await message.answer("Suhbat tarixi tozalandi ✅")
+
+
+@router.message(Command("forget"))
+async def cmd_forget(message: Message):
+    chat_history.pop(message.from_user.id, None)
+    n = await asyncio.to_thread(db_clear_memory, message.from_user.id)
+    await message.answer(f"Xotira tozalandi ✅ ({n} ta yozuv o'chirildi). Endi toza varaqdan boshlaymiz.")
 
 
 async def transcribe_audio(data: bytes, mime: str) -> str:
@@ -1586,7 +1605,7 @@ async def handle_text(message: Message, bot: Bot):
                 f"🎯 Qiziqishlar: {state['interests']}\n"
                 f"🚀 Maqsadlar: {state['goals']}\n\n"
                 f"Endi menga istalgan savolni bering — men doim yordamga tayyorman! 😊\n\n"
-                f"Komandalar: /hisobot, /eslatmalar, /clear",
+                f"Komandalar: /hisobot, /eslatmalar, /clear, /forget",
                 parse_mode="Markdown"
             )
         return
