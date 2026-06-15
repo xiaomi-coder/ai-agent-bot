@@ -581,6 +581,44 @@ def _gemini_search(query: str) -> str:
 
 
 # ============================================================
+# HAVOLA O'QISH (URL kontentini olish)
+# ============================================================
+
+import re as _re
+
+def do_fetch_url(url: str) -> str:
+    if not url.startswith(("http://", "https://")):
+        url = "https://" + url
+    try:
+        resp = requests.get(
+            url,
+            headers={"User-Agent": "Mozilla/5.0 (compatible; SirdoshBot/1.0)"},
+            timeout=12,
+        )
+        ctype = resp.headers.get("content-type", "")
+        if "html" not in ctype and "text" not in ctype:
+            return f"Bu havola matn sahifa emas ({ctype}). Tahlil qila olmadim."
+
+        html = resp.text
+        # script/style ni olib tashlaymiz
+        html = _re.sub(r"<script[\s\S]*?</script>", " ", html, flags=_re.I)
+        html = _re.sub(r"<style[\s\S]*?</style>", " ", html, flags=_re.I)
+        # title ni ajratamiz
+        title_m = _re.search(r"<title[^>]*>(.*?)</title>", html, flags=_re.I | _re.S)
+        title = title_m.group(1).strip() if title_m else ""
+        # teglarni olib tashlaymiz
+        text = _re.sub(r"<[^>]+>", " ", html)
+        text = _re.sub(r"\s+", " ", text).strip()
+        if not text:
+            return "Sahifadan matn topilmadi (ehtimol JavaScript bilan yuklanadi)."
+        text = text[:6000]
+        return f"SAHIFA: {title}\nURL: {url}\n\nMAZMUN:\n{text}"
+    except Exception as e:
+        logger.exception("URL o'qishda xato")
+        return f"Havolani ocholmadim: {e}"
+
+
+# ============================================================
 # OB-HAVO (Open-Meteo — bepul, kalitsiz, aniq)
 # ============================================================
 
@@ -743,6 +781,17 @@ FUNCTION_DECLARATIONS = [
         ),
     ),
     types.FunctionDeclaration(
+        name="fetch_url",
+        description="Havola (URL/link) mazmunini o'qish va tahlil qilish. Foydalanuvchi link yuborsa yoki 'shu saytni ko'r', 'bu maqolani o'qib ber' desa ishlatiladi.",
+        parameters=types.Schema(
+            type=types.Type.OBJECT,
+            properties={
+                "url": types.Schema(type=types.Type.STRING, description="To'liq havola (masalan: https://example.com/page)"),
+            },
+            required=["url"],
+        ),
+    ),
+    types.FunctionDeclaration(
         name="add_transaction",
         description="Kirim yoki chiqimni bazaga yozish. Pul sarflagani/topgani haqida aytsa yoki chek rasmida summa ko'rinsa ishlatiladi.",
         parameters=types.Schema(
@@ -874,11 +923,12 @@ Qoidalar:
 - Funksiya natijasini chiroyli, tushunarli qilib yetkaz.
 
 MUHIM — SUHBAT SIFATI:
-- HECH QACHON bir xil umumiy javobni takrorlama ("men yordam bera olaman", "blogerlik nima" kabi). Har bir savolga ANIQ, MAZMUNLI, AMALIY javob ber.
-- Foydalanuvchi biror sohada (blogerlik, biznes, dasturlash...) yordam so'rasa — umumiy gap urma, KONKRET maslahat, qadam-baqadam reja, aniq misollar ber.
-- Sen havola/linklarni ocha olmaysan. Foydalanuvchi link bersa, "men linkni ocholmayman, lekin mazmunini ayting" deb yoki uning username/nomini web_search bilan qidir.
-- Faqat zarur bo'lganda savol ber. Yetarli ma'lumot bo'lsa — darrov foydali javob ber, ortiqcha savol berma.
-- Sen oddiy "yordamchi" emas, haqiqiy aqlli maslahatchisan — chuqur, foydali, inson kabi muloqot qil.
+- Sen HAR SOHADA bilimli aqlli maslahatchisan: blogerlik, biznes, dasturlash, ta'lim, sog'liq, psixologiya, marketing, din, tarix, fan — istalgan mavzuda foydali javob ber.
+- HECH QACHON bir xil umumiy javobni takrorlama ("men yordam bera olaman" kabi). Har savolga ANIQ, MAZMUNLI, AMALIY javob ber.
+- Biror sohada yordam so'ralsa — umumiy gap urma, KONKRET maslahat, qadam-baqadam reja, aniq misollar ber.
+- Foydalanuvchi link/havola yuborsa — fetch_url bilan o'qib, mazmunini tahlil qil va aniq javob ber.
+- Faqat zarur bo'lganda savol ber. Yetarli ma'lumot bo'lsa — darrov foydali javob ber.
+- Sen oddiy "yordamchi" emas, haqiqiy aqlli sirdoshsan — chuqur, foydali, inson kabi muloqot qil.
 {profile_section}{memory_section}
 """
 
@@ -891,6 +941,8 @@ def execute_function(user_id: int, name: str, args: dict) -> str:
             return do_get_weather(args.get("location", "Toshkent"), args.get("when", "bugun"))
         if name == "get_crypto":
             return do_get_crypto(args.get("coin", "bitcoin"))
+        if name == "fetch_url":
+            return do_fetch_url(args.get("url", ""))
         if name == "add_transaction":
             return db_add_transaction(
                 user_id, args.get("tx_type", "chiqim"), float(args.get("amount", 0)),
