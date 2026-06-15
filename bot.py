@@ -792,6 +792,17 @@ FUNCTION_DECLARATIONS = [
         ),
     ),
     types.FunctionDeclaration(
+        name="remember",
+        description="Foydalanuvchi haqida MUHIM, uzoq muddat eslab qolish kerak bo'lgan faktni saqlash. Masalan: uning loyihasi, ishi, maqsadi, sevimli narsasi, oilasi, muhim sanalari, qarorlari. Foydalanuvchi o'zi haqida yangi muhim narsa aytsa — DARHOL shuni chaqir.",
+        parameters=types.Schema(
+            type=types.Type.OBJECT,
+            properties={
+                "fact": types.Schema(type=types.Type.STRING, description="Eslab qolinadigan qisqa fakt (masalan: 'Foydalanuvchi YouTube blog ochmoqchi, mavzu - sayohat')"),
+            },
+            required=["fact"],
+        ),
+    ),
+    types.FunctionDeclaration(
         name="add_transaction",
         description="Kirim yoki chiqimni bazaga yozish. Pul sarflagani/topgani haqida aytsa yoki chek rasmida summa ko'rinsa ishlatiladi.",
         parameters=types.Schema(
@@ -928,7 +939,13 @@ MUHIM — SUHBAT SIFATI:
 - Biror sohada yordam so'ralsa — umumiy gap urma, KONKRET maslahat, qadam-baqadam reja, aniq misollar ber.
 - Foydalanuvchi link/havola yuborsa — fetch_url bilan o'qib, mazmunini tahlil qil va aniq javob ber.
 - Faqat zarur bo'lganda savol ber. Yetarli ma'lumot bo'lsa — darrov foydali javob ber.
-- Sen oddiy "yordamchi" emas, haqiqiy aqlli sirdoshsan — chuqur, foydali, inson kabi muloqot qil.
+- Sen oddiy "yordamchi" emas, haqiqiy aqlli SIRDOSHsan — chuqur, foydali, inson kabi muloqot qil.
+
+XOTIRA VA G'OYA (eng muhim!):
+- Foydalanuvchi o'zi haqida muhim narsa aytsa (ishi, loyihasi, maqsadi, qiziqishi, muammosi, qarori) — DARHOL "remember" funksiyasini chaqirib eslab qol. Keyingi suhbatlarda shuni hisobga ol.
+- Foydalanuvchining ishini, loyihasini o'rgan va PROAKTIV ravishda foydali G'OYALAR, takliflar ber — so'ramasa ham. Masalan blogger bo'lsa kontent g'oyalari, tadbirkor bo'lsa biznes takliflari.
+- Avvalgi suhbatlardagi xotirani eslab, "o'tgan safar aytgan loyihangiz qanday ketyapti?" kabi tabiiy, g'amxo'r muloqot qil.
+- Sen egangning eng yaqin sirdoshi, maslahatchisi va ilhomchisisan.
 {profile_section}{memory_section}
 """
 
@@ -943,6 +960,12 @@ def execute_function(user_id: int, name: str, args: dict) -> str:
             return do_get_crypto(args.get("coin", "bitcoin"))
         if name == "fetch_url":
             return do_fetch_url(args.get("url", ""))
+        if name == "remember":
+            fact = args.get("fact", "").strip()
+            if fact:
+                db_add_memory(user_id, fact)
+                return "Eslab qoldim ✅"
+            return "Eslab qolinadigan narsa yo'q."
         if name == "add_transaction":
             return db_add_transaction(
                 user_id, args.get("tx_type", "chiqim"), float(args.get("amount", 0)),
