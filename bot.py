@@ -619,6 +619,39 @@ def do_fetch_url(url: str) -> str:
 
 
 # ============================================================
+# HUJJAT O'QISH (Word, Excel, matn)
+# ============================================================
+
+def extract_docx(data: bytes) -> str:
+    import docx
+    doc = docx.Document(io.BytesIO(data))
+    parts = [p.text for p in doc.paragraphs if p.text.strip()]
+    # jadvallarni ham olamiz
+    for table in doc.tables:
+        for row in table.rows:
+            cells = [c.text.strip() for c in row.cells]
+            if any(cells):
+                parts.append(" | ".join(cells))
+    return "\n".join(parts).strip()
+
+
+def extract_xlsx(data: bytes) -> str:
+    import openpyxl
+    wb = openpyxl.load_workbook(io.BytesIO(data), data_only=True, read_only=True)
+    out = []
+    for ws in wb.worksheets:
+        out.append(f"=== Varaq: {ws.title} ===")
+        for row in ws.iter_rows(values_only=True):
+            cells = [str(c) for c in row if c is not None]
+            if cells:
+                out.append(" | ".join(cells))
+            if len(out) > 500:  # juda katta fayllarni cheklash
+                out.append("... (qisqartirildi)")
+                break
+    return "\n".join(out).strip()
+
+
+# ============================================================
 # OB-HAVO (Open-Meteo — bepul, kalitsiz, aniq)
 # ============================================================
 
@@ -1374,6 +1407,69 @@ async def handle_photo(message: Message, bot: Bot):
     except Exception:
         logger.exception("Rasmda xato")
         await message.answer("Rasmni o'qishda xatolik 😕 Qaytadan urinib ko'ring.")
+
+
+@router.message(F.document)
+async def handle_document(message: Message, bot: Bot):
+    uid = message.from_user.id
+    if not bot_enabled and uid != ADMIN_ID:
+        await message.answer("Bot vaqtincha o'chirilgan. Tez orada qaytamiz!")
+        return
+    if not await asyncio.to_thread(db_is_approved, uid):
+        await message.answer("Botdan foydalanish uchun admin ruxsati kerak. /start bosing.")
+        return
+    await asyncio.to_thread(db_track_user, uid, message.from_user.username, message.from_user.full_name)
+    await bot.send_chat_action(message.chat.id, ChatAction.TYPING)
+
+    doc = message.document
+    fname = (doc.file_name or "fayl").lower()
+    caption = message.caption or ""
+
+    if doc.file_size and doc.file_size > 20 * 1024 * 1024:
+        await message.answer("Fayl juda katta (20 MB dan oshmasin).")
+        return
+
+    try:
+        file = await bot.get_file(doc.file_id)
+        buf = io.BytesIO()
+        await bot.download_file(file.file_path, buf)
+        data = buf.getvalue()
+
+        instruction = caption or "Bu hujjatni tahlil qil, asosiy mazmunini va muhim nuqtalarini tushuntir."
+
+        # PDF — Gemini to'g'ridan-to'g'ri o'qiydi
+        if fname.endswith(".pdf") or doc.mime_type == "application/pdf":
+            parts = [
+                types.Part.from_bytes(data=data, mime_type="application/pdf"),
+                types.Part.from_text(text=instruction),
+            ]
+            await send_long(message, await ask_agent(uid, parts))
+            return
+
+        # Word / Excel / matn — matnni ajratamiz
+        if fname.endswith(".docx"):
+            text = await asyncio.to_thread(extract_docx, data)
+        elif fname.endswith((".xlsx", ".xlsm")):
+            text = await asyncio.to_thread(extract_xlsx, data)
+        elif fname.endswith((".txt", ".csv", ".md", ".json")):
+            text = data.decode("utf-8", errors="ignore")
+        elif fname.endswith(".doc"):
+            await message.answer("Eski .doc formati qo'llab-quvvatlanmaydi. Iltimos .docx ga aylantiring.")
+            return
+        else:
+            await message.answer("Bu fayl turini o'qiy olmadim. PDF, Word (.docx), Excel (.xlsx) yoki matn yuboring.")
+            return
+
+        if not text.strip():
+            await message.answer("Hujjatdan matn topilmadi (bo'sh yoki rasm ko'rinishida).")
+            return
+
+        text = text[:30000]  # juda katta hujjatlarni cheklash
+        prompt = f"{instruction}\n\n=== HUJJAT MAZMUNI ({doc.file_name}) ===\n{text}"
+        await send_long(message, await ask_agent(uid, [types.Part.from_text(text=prompt)]))
+    except Exception:
+        logger.exception("Hujjatda xato")
+        await message.answer("Hujjatni o'qishda xatolik 😕 Qaytadan urinib ko'ring.")
 
 
 @router.message(F.text)
