@@ -593,36 +593,51 @@ def _gemini_search(query: str) -> str:
 
 import re as _re
 
+_SOCIAL_DOMAINS = ("instagram.com", "tiktok.com", "t.me", "facebook.com", "fb.com", "twitter.com", "x.com")
+
 def do_fetch_url(url: str) -> str:
     if not url.startswith(("http://", "https://")):
         url = "https://" + url
+
+    # Ijtimoiy tarmoqlar login talab qiladi — qidiruvga yo'naltiramiz
+    if any(d in url.lower() for d in _SOCIAL_DOMAINS):
+        return (
+            "Bu ijtimoiy tarmoq sahifasi (Instagram/TikTok/Telegram va h.k.) — "
+            "ular login talab qilgani uchun to'g'ridan-to'g'ri o'qib bo'lmaydi. "
+            "Iltimos profil/akkaunt nomini (username) yoki mavzuni ayting, men web_search bilan qidiraman."
+        )
     try:
         resp = requests.get(
             url,
-            headers={"User-Agent": "Mozilla/5.0 (compatible; SirdoshBot/1.0)"},
+            headers={
+                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+                              "(KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "uz,ru;q=0.9,en;q=0.8",
+            },
             timeout=12,
+            allow_redirects=True,
         )
+        if resp.status_code == 403 or resp.status_code == 401:
+            return "Bu sayt avtomatik o'qishni bloklagan (403). Mazmunini o'zingiz qisqacha aytsangiz tahlil qilaman."
         ctype = resp.headers.get("content-type", "")
         if "html" not in ctype and "text" not in ctype:
             return f"Bu havola matn sahifa emas ({ctype}). Tahlil qila olmadim."
 
         html = resp.text
-        # script/style ni olib tashlaymiz
         html = _re.sub(r"<script[\s\S]*?</script>", " ", html, flags=_re.I)
         html = _re.sub(r"<style[\s\S]*?</style>", " ", html, flags=_re.I)
-        # title ni ajratamiz
         title_m = _re.search(r"<title[^>]*>(.*?)</title>", html, flags=_re.I | _re.S)
         title = title_m.group(1).strip() if title_m else ""
-        # teglarni olib tashlaymiz
         text = _re.sub(r"<[^>]+>", " ", html)
         text = _re.sub(r"\s+", " ", text).strip()
         if not text:
-            return "Sahifadan matn topilmadi (ehtimol JavaScript bilan yuklanadi)."
+            return "Sahifadan matn topilmadi (ehtimol JavaScript bilan yuklanadi). Mazmunini o'zingiz ayting."
         text = text[:6000]
         return f"SAHIFA: {title}\nURL: {url}\n\nMAZMUN:\n{text}"
     except Exception as e:
         logger.exception("URL o'qishda xato")
-        return f"Havolani ocholmadim: {e}"
+        return f"Havolani ocholmadim: {e}. Mazmunini o'zingiz qisqacha aytsangiz tahlil qilaman."
 
 
 # ============================================================
@@ -1008,7 +1023,7 @@ MUHIM — SUHBAT SIFATI:
 - Sen HAR SOHADA bilimli aqlli maslahatchisan: blogerlik, biznes, dasturlash, ta'lim, sog'liq, psixologiya, marketing, din, tarix, fan — istalgan mavzuda foydali javob ber.
 - HECH QACHON bir xil umumiy javobni takrorlama ("men yordam bera olaman" kabi). Har savolga ANIQ, MAZMUNLI, AMALIY javob ber.
 - Biror sohada yordam so'ralsa — umumiy gap urma, KONKRET maslahat, qadam-baqadam reja, aniq misollar ber.
-- Foydalanuvchi link/havola yuborsa — fetch_url bilan o'qib, mazmunini tahlil qil va aniq javob ber.
+- Foydalanuvchi link/havola yuborsa — fetch_url bilan o'qib, mazmunini tahlil qil. Agar fetch_url ishlamasa (ijtimoiy tarmoq/bloklangan), username yoki mavzuni web_search bilan qidirib top.
 - Faqat zarur bo'lganda savol ber. Yetarli ma'lumot bo'lsa — darrov foydali javob ber.
 - Sen oddiy "yordamchi" emas, haqiqiy aqlli SIRDOSHsan — chuqur, foydali, inson kabi muloqot qil.
 
@@ -1391,9 +1406,26 @@ async def cmd_clear(message: Message):
 
 @router.message(Command("forget"))
 async def cmd_forget(message: Message):
-    chat_history.pop(message.from_user.id, None)
-    n = await asyncio.to_thread(db_clear_memory, message.from_user.id)
-    await message.answer(f"Xotira tozalandi ✅ ({n} ta yozuv o'chirildi). Endi toza varaqdan boshlaymiz.")
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="Ha, xotirani o'chir", callback_data="forget_yes"),
+        InlineKeyboardButton(text="Yo'q", callback_data="forget_no"),
+    ]])
+    await message.answer(
+        "⚠️ Bu men siz haqingizda eslab qolgan barcha narsalarni o'chiradi "
+        "(loyihalaringiz, maqsadlaringiz...). Profil ma'lumotlari saqlanadi.\n\nRostdan o'chiraymi?",
+        reply_markup=kb,
+    )
+
+
+@router.callback_query(F.data.startswith("forget_"))
+async def forget_callback(callback: CallbackQuery):
+    if callback.data == "forget_yes":
+        chat_history.pop(callback.from_user.id, None)
+        n = await asyncio.to_thread(db_clear_memory, callback.from_user.id)
+        await callback.message.edit_text(f"Xotira tozalandi ✅ ({n} ta yozuv o'chirildi).")
+    else:
+        await callback.message.edit_text("Bekor qilindi. Hech narsa o'chirilmadi 👍")
+    await callback.answer()
 
 
 async def transcribe_audio(data: bytes, mime: str) -> str:
