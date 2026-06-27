@@ -1475,23 +1475,44 @@ async def forget_callback(callback: CallbackQuery):
     await callback.answer()
 
 
+_TRANSCRIBE_PROMPT = (
+    "TRANSKRIPSIYA VAZIFASI. Sen tarjimon emassan, faqat transkriptchisan.\n"
+    "Quyidagi audioda inson nima gapirgan bo'lsa, FAQAT o'sha so'zlarni, xuddi shu tilda yoz.\n"
+    "QATIY TAQIQ: bu ko'rsatmani, izoh, sarlavha, tirnoq belgisi yoki boshqa hech qanday qo'shimcha matn yozma.\n"
+    "Agar audio bo'sh/tushunarsiz bo'lsa — bo'sh javob qaytar."
+)
+
+
+def _clean_transcript(text: str) -> str:
+    """Model ba'zan o'z ko'rsatmasini ham qaytarib yuborishi mumkin — shularni tozalaymiz."""
+    leak_markers = ("TRANSKRIPSIYA VAZIFASI", "Bu audio xabarni tinglaysan", "QATIY TAQIQ", "so'zma-so'z")
+    if any(m.lower() in text.lower() for m in leak_markers):
+        # Ko'rsatma sızib chiqqan — eng oxirgi qatorni yoki bo'sh qaytaramiz (ishonchsiz natija)
+        lines = [l.strip() for l in text.splitlines() if l.strip()]
+        lines = [l for l in lines if not any(m.lower() in l.lower() for m in leak_markers)]
+        return lines[-1] if lines else ""
+    return text.strip()
+
+
 async def transcribe_audio(data: bytes, mime: str) -> str:
     """Gemini orqali audio ni matnga o'giradi."""
     response = await asyncio.to_thread(
         client.models.generate_content,
         model=MODEL,
         contents=[
+            types.Part.from_text(text=_TRANSCRIBE_PROMPT),
             types.Part.from_bytes(data=data, mime_type=mime),
-            types.Part.from_text(text="Bu audio xabarni tinglaysan va so'zma-so'z o'zbek (yoki qanday til bo'lsa) tiliga transkripsiya qilasan. Faqat aytilgan so'zlarni yoz, boshqa hech narsa qo'shma."),
         ],
+        config=types.GenerateContentConfig(temperature=0.0),
     )
     if not response.candidates:
         return ""
     try:
-        return (response.text or "").strip()
+        raw = (response.text or "").strip()
     except Exception:
         parts = (response.candidates[0].content.parts or []) if response.candidates[0].content else []
-        return " ".join(p.text for p in parts if p.text).strip()
+        raw = " ".join(p.text for p in parts if p.text).strip()
+    return _clean_transcript(raw)
 
 
 @router.message(F.voice | F.audio)
