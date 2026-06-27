@@ -21,6 +21,7 @@ import logging
 
 from fastapi import FastAPI, UploadFile, File, Form, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
 from pydantic import BaseModel
 from google.genai import types
 
@@ -80,6 +81,20 @@ async def chat(req: ChatRequest, authorization: str | None = Header(default=None
 
     reply = await bot.ask_agent(req.user_id, [types.Part.from_text(text=req.text)])
     return ChatResponse(reply=reply)
+
+
+class SpeakRequest(BaseModel):
+    text: str
+
+
+@app.post("/speak")
+async def speak(req: SpeakRequest, authorization: str | None = Header(default=None)):
+    _check_auth(authorization)
+    import asyncio
+    wav = await asyncio.to_thread(bot.do_tts, req.text)
+    if wav is None:
+        raise HTTPException(status_code=503, detail="Ovoz yaratib bo'lmadi")
+    return Response(content=wav, media_type="audio/wav")
 
 
 @app.post("/voice")
