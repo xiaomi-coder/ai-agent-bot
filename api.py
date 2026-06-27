@@ -65,6 +65,7 @@ class ChatRequest(BaseModel):
 
 class ChatResponse(BaseModel):
     reply: str
+    actions: list[dict] = []
 
 
 @app.get("/")
@@ -79,8 +80,9 @@ async def chat(req: ChatRequest, authorization: str | None = Header(default=None
     bot.db_track_user(req.user_id, None, req.name or "Ilova foydalanuvchisi")
     bot.db_approve_user(req.user_id)
 
-    reply = await bot.ask_agent(req.user_id, [types.Part.from_text(text=req.text)])
-    return ChatResponse(reply=reply)
+    actions: list = []
+    reply = await bot.ask_agent(req.user_id, [types.Part.from_text(text=req.text)], device_action_sink=actions)
+    return ChatResponse(reply=reply, actions=actions)
 
 
 class SpeakRequest(BaseModel):
@@ -114,7 +116,8 @@ async def voice(
     # Gemini ovozni o'zbek tilida tushunadi
     transcript = await bot.transcribe_audio(data, mime)
     if not transcript:
-        return {"transcript": "", "reply": "Ovozni tushunib bo'lmadi, qaytadan urinib ko'ring."}
+        return {"transcript": "", "reply": "Ovozni tushunib bo'lmadi, qaytadan urinib ko'ring.", "actions": []}
 
-    reply = await bot.ask_agent(user_id, [types.Part.from_text(text=transcript)])
-    return {"transcript": transcript, "reply": reply}
+    actions: list = []
+    reply = await bot.ask_agent(user_id, [types.Part.from_text(text=transcript)], device_action_sink=actions)
+    return {"transcript": transcript, "reply": reply, "actions": actions}
