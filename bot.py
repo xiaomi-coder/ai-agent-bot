@@ -1048,6 +1048,51 @@ DEVICE_ACTION_DECLARATIONS = [
             required=["hour", "minute"],
         ),
     ),
+    types.FunctionDeclaration(
+        name="make_call",
+        description="Telefon raqamiga qo'ng'iroq qilish. 'Onamga qo'ng'iroq qil', '+998901234567 ga qo'ng'iroq qil' kabi so'rovlarda ishlatiladi.",
+        parameters=types.Schema(
+            type=types.Type.OBJECT,
+            properties={
+                "phone_number": types.Schema(type=types.Type.STRING, description="To'liq telefon raqami (masalan +998901234567)"),
+            },
+            required=["phone_number"],
+        ),
+    ),
+    types.FunctionDeclaration(
+        name="send_sms",
+        description="SMS xabar yuborish. 'Bu raqamga SMS yubor: ...' kabi so'rovlarda ishlatiladi. Foydalanuvchi yuborishni xabar ilovasida tasdiqlashi kerak bo'ladi.",
+        parameters=types.Schema(
+            type=types.Type.OBJECT,
+            properties={
+                "phone_number": types.Schema(type=types.Type.STRING, description="Qabul qiluvchi raqam"),
+                "message": types.Schema(type=types.Type.STRING, description="Xabar matni"),
+            },
+            required=["phone_number", "message"],
+        ),
+    ),
+    types.FunctionDeclaration(
+        name="set_volume",
+        description="Telefon ovoz balandligini boshqarish. 'Ovozni baland qil', 'tovushni kamaytir', 'ovozni o'chir' kabi so'rovlarda ishlatiladi.",
+        parameters=types.Schema(
+            type=types.Type.OBJECT,
+            properties={
+                "direction": types.Schema(type=types.Type.STRING, enum=["up", "down", "mute"], description="Ovoz yo'nalishi"),
+            },
+            required=["direction"],
+        ),
+    ),
+    types.FunctionDeclaration(
+        name="toggle_flashlight",
+        description="Telefon fonarini (chiroq) yoqish/o'chirish. 'Fonarni yoq', 'chiroqni o'chir' kabi so'rovlarda ishlatiladi.",
+        parameters=types.Schema(
+            type=types.Type.OBJECT,
+            properties={
+                "on": types.Schema(type=types.Type.BOOLEAN, description="True = yoq, False = o'chir"),
+            },
+            required=["on"],
+        ),
+    ),
 ]
 
 
@@ -1255,6 +1300,23 @@ async def ask_agent(
                     "label": args.get("label", ""),
                 })
                 result = f"Budilnik {hour:02d}:{minute:02d} ga o'rnatilmoqda."
+            elif fc.name == "make_call" and device_action_sink is not None:
+                phone = args.get("phone_number", "")
+                device_action_sink.append({"type": "make_call", "phone_number": phone})
+                result = f"{phone} raqamiga qo'ng'iroq qilinmoqda."
+            elif fc.name == "send_sms" and device_action_sink is not None:
+                phone = args.get("phone_number", "")
+                msg = args.get("message", "")
+                device_action_sink.append({"type": "send_sms", "phone_number": phone, "message": msg})
+                result = f"{phone} raqamiga SMS tayyorlanmoqda."
+            elif fc.name == "set_volume" and device_action_sink is not None:
+                direction = args.get("direction", "up")
+                device_action_sink.append({"type": "set_volume", "direction": direction})
+                result = "Ovoz sozlanmoqda."
+            elif fc.name == "toggle_flashlight" and device_action_sink is not None:
+                on = bool(args.get("on", True))
+                device_action_sink.append({"type": "toggle_flashlight", "on": on})
+                result = "Fonar yoqilmoqda." if on else "Fonar o'chirilmoqda."
             else:
                 result = await asyncio.to_thread(execute_function, user_id, fc.name, args)
             result_parts.append(types.Part.from_function_response(name=fc.name, response={"result": result}))
