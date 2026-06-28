@@ -1050,13 +1050,37 @@ DEVICE_ACTION_DECLARATIONS = [
     ),
     types.FunctionDeclaration(
         name="make_call",
-        description="Telefon raqamiga qo'ng'iroq qilish. 'Onamga qo'ng'iroq qil', '+998901234567 ga qo'ng'iroq qil' kabi so'rovlarda ishlatiladi.",
+        description="Qo'ng'iroq qilish. 'Onamga qo'ng'iroq qil', '+998901234567 ga qo'ng'iroq qil' kabi so'rovlarda ishlatiladi. Agar ism aytilsa (raqam emas) — contact_name ber, ilova telefondagi kontaktlardan o'zi qidiradi.",
         parameters=types.Schema(
             type=types.Type.OBJECT,
             properties={
-                "phone_number": types.Schema(type=types.Type.STRING, description="To'liq telefon raqami (masalan +998901234567)"),
+                "phone_number": types.Schema(type=types.Type.STRING, description="To'liq telefon raqami, agar aytilgan bo'lsa"),
+                "contact_name": types.Schema(type=types.Type.STRING, description="Kontakt ismi, agar raqam o'rniga ism aytilgan bo'lsa (masalan: Ona, Ali)"),
             },
-            required=["phone_number"],
+        ),
+    ),
+    types.FunctionDeclaration(
+        name="search_in_app",
+        description="Ilova ichida biror narsani qidirish/ochish. 'YouTube'da bu qo'shiqni qidir', 'Yandex Mapsda restoran top' kabi 'ilova och VA shu ishni qil' birikma so'rovlarida ishlatiladi.",
+        parameters=types.Schema(
+            type=types.Type.OBJECT,
+            properties={
+                "app_name": types.Schema(type=types.Type.STRING, description="Ilova nomi: youtube, instagram, chrome, maps va h.k."),
+                "query": types.Schema(type=types.Type.STRING, description="Qidiriladigan narsa (qo'shiq nomi, joy, mavzu)"),
+            },
+            required=["app_name", "query"],
+        ),
+    ),
+    types.FunctionDeclaration(
+        name="open_telegram_chat",
+        description="Telegram'da ma'lum bir kishi/username bilan suhbatni ochish, ixtiyoriy ravishda xabar matnini tayyorlab qo'yish. 'Telegram'da Aliyevga yoz: ...', 'Vali bilan suhbatni och' kabi so'rovlarda ishlatiladi. Foydalanuvchi baribir Yuborish tugmasini bosishi kerak (avtomatik yuborilmaydi).",
+        parameters=types.Schema(
+            type=types.Type.OBJECT,
+            properties={
+                "username": types.Schema(type=types.Type.STRING, description="Telegram username (@ belgisiz) yoki kontakt ismi"),
+                "message": types.Schema(type=types.Type.STRING, description="Tayyorlanadigan xabar matni (ixtiyoriy)"),
+            },
+            required=["username"],
         ),
     ),
     types.FunctionDeclaration(
@@ -1135,6 +1159,13 @@ Imkoniyatlaring:
 4. Eslatmalar — set_reminder (vaqtni aniq 'YYYY-MM-DD HH:MM' ga aylantir).
 5. Qaydlar — "eslab qol" desa add_note, "nima edi?" desa find_notes.
 6. Rasmlar — chek/kvitansiya rasmi kelsa, summa va do'konni aniqlab add_transaction chaqir.
+
+TELEFONNI BOSHQARISH (agar shu funksiyalar mavjud bo'lsa — Shoxa ilovasidasan):
+- "... och", "... kir", "... ochib ber" + ilova nomi → open_app. HECH IKKILANMA, albatta chaqir, faqat gapirib qo'ymagin.
+- Ilova ochish VA shu ilova ichida biror narsa qilish birga aytilsa (masalan "YouTube'da Daler Mansurov qo'shig'ini qidir") → search_in_app (app_name + query), open_app EMAS.
+- "Telegram'da <kimga> yoz/xabar yubor" → open_telegram_chat (username + message). Agar shaxs ismi aytilsa lekin @username noma'lum bo'lsa, contact_name sifatida ismni username maydoniga yoz.
+- Qo'ng'iroq: raqam aytilsa phone_number, ism aytilsa (masalan "Onamga qo'ng'iroq qil") contact_name bilan make_call.
+- Bularning barchasi HAQIQIY telefonda amalga oshadi — sen faqat signal berasan, natijani "amalga oshirilmoqda" deb tabiiy ayt, "men buni qila olmayman" demagin.
 
 Qoidalar:
 - Foydalanuvchi qaysi tilda gapirsa, o'sha tilda javob ber (asosan o'zbek).
@@ -1302,8 +1333,19 @@ async def ask_agent(
                 result = f"Budilnik {hour:02d}:{minute:02d} ga o'rnatilmoqda."
             elif fc.name == "make_call" and device_action_sink is not None:
                 phone = args.get("phone_number", "")
-                device_action_sink.append({"type": "make_call", "phone_number": phone})
-                result = f"{phone} raqamiga qo'ng'iroq qilinmoqda."
+                contact = args.get("contact_name", "")
+                device_action_sink.append({"type": "make_call", "phone_number": phone, "contact_name": contact})
+                result = f"{contact or phone} ga qo'ng'iroq qilinmoqda."
+            elif fc.name == "search_in_app" and device_action_sink is not None:
+                app_name = args.get("app_name", "")
+                query = args.get("query", "")
+                device_action_sink.append({"type": "search_in_app", "app_name": app_name, "query": query})
+                result = f"{app_name} ilovasida '{query}' qidirilmoqda."
+            elif fc.name == "open_telegram_chat" and device_action_sink is not None:
+                username = args.get("username", "")
+                msg = args.get("message", "")
+                device_action_sink.append({"type": "open_telegram_chat", "username": username, "message": msg})
+                result = f"Telegram'da {username} bilan suhbat ochilmoqda."
             elif fc.name == "send_sms" and device_action_sink is not None:
                 phone = args.get("phone_number", "")
                 msg = args.get("message", "")
