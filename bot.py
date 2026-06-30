@@ -1285,6 +1285,8 @@ async def ask_agent(
     config = types.GenerateContentConfig(
         system_instruction=build_system_prompt(user_id),
         temperature=0.7,
+        max_output_tokens=2048,
+        thinking_config=types.ThinkingConfig(thinking_budget=0),
         tools=[types.Tool(function_declarations=declarations)],
     )
 
