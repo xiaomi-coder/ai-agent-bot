@@ -521,6 +521,34 @@ def db_clear_memory(user_id: int) -> int:
 
 
 # ============================================================
+# YOUTUBE VIDEO TOPISH (to'g'ridan-to'g'ri ijro etish uchun)
+# ============================================================
+
+def resolve_youtube_video(query: str) -> str:
+    """Google CSE orqali so'ralgan qo'shiq/video uchun aniq YouTube havolasini topadi."""
+    if not (GOOGLE_CSE_KEY and GOOGLE_CSE_ID):
+        return ""
+    try:
+        resp = requests.get(
+            "https://www.googleapis.com/customsearch/v1",
+            params={
+                "key": GOOGLE_CSE_KEY, "cx": GOOGLE_CSE_ID,
+                "q": f"{query} youtube",
+                "num": 5,
+            },
+            timeout=10,
+        )
+        items = resp.json().get("items", [])
+        for it in items:
+            link = it.get("link", "")
+            if "youtube.com/watch" in link or "youtu.be/" in link:
+                return link
+    except Exception:
+        logger.exception("YouTube video qidirishda xato")
+    return ""
+
+
+# ============================================================
 # INTERNET QIDIRUV
 # ============================================================
 
@@ -1363,8 +1391,16 @@ async def ask_agent(
             elif fc.name == "search_in_app" and device_action_sink is not None:
                 app_name = args.get("app_name", "")
                 query = args.get("query", "")
-                device_action_sink.append({"type": "search_in_app", "app_name": app_name, "query": query})
-                result = f"{app_name} ilovasida '{query}' qidirilmoqda."
+                video_url = ""
+                if "youtube" in app_name.lower():
+                    video_url = await asyncio.to_thread(resolve_youtube_video, query)
+                device_action_sink.append({
+                    "type": "search_in_app", "app_name": app_name, "query": query, "video_url": video_url,
+                })
+                if video_url:
+                    result = f"'{query}' YouTube'da topildi va ijro etilmoqda."
+                else:
+                    result = f"{app_name} ilovasida '{query}' qidirilmoqda."
             elif fc.name == "open_telegram_chat" and device_action_sink is not None:
                 username = args.get("username", "")
                 msg = args.get("message", "")
