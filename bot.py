@@ -1294,6 +1294,7 @@ async def ask_agent(
             client.models.generate_content, model=MODEL, contents=contents, config=config,
         )
         if not response.candidates:
+            logger.warning("ask_agent: bo'sh candidates. prompt_feedback=%s", getattr(response, "prompt_feedback", None))
             break
         candidate = response.candidates[0]
         parts = (candidate.content.parts or []) if candidate.content else []
@@ -1304,6 +1305,12 @@ async def ask_agent(
                 txt = ""
             if txt:
                 answer = txt
+            else:
+                logger.warning(
+                    "ask_agent: bo'sh parts. finish_reason=%s safety=%s",
+                    getattr(candidate, "finish_reason", None),
+                    getattr(candidate, "safety_ratings", None),
+                )
             break
 
         function_calls = [p.function_call for p in parts if p.function_call]
@@ -1314,6 +1321,13 @@ async def ask_agent(
                 txt = ""
             if txt:
                 answer = txt
+            else:
+                logger.warning(
+                    "ask_agent: matn yo'q. finish_reason=%s safety=%s parts=%s",
+                    getattr(candidate, "finish_reason", None),
+                    getattr(candidate, "safety_ratings", None),
+                    parts,
+                )
             break
 
         contents.append(candidate.content)
