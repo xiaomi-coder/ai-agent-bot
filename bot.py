@@ -1061,7 +1061,7 @@ DEVICE_ACTION_DECLARATIONS = [
     ),
     types.FunctionDeclaration(
         name="search_in_app",
-        description="Ilova ichida biror narsani qidirish/ochish. 'YouTube'da bu qo'shiqni qidir', 'Yandex Mapsda restoran top' kabi 'ilova och VA shu ishni qil' birikma so'rovlarida ishlatiladi.",
+        description="Ilova ichida biror narsani qidirish/ochish. 'YouTube'da bu qo'shiqni qidir', 'Yandex Mapsda restoran top' kabi 'ilova och VA shu ishni qil' birikma so'rovlarida ishlatiladi. FAQAT YANGI qidiruv so'ralganda chaqir — agar foydalanuvchi 'eshitamiz', 'xa', 'rahmat', 'zo'r' kabi oddiy javob/tasdiq aytsa, BU FUNKSIYANI QAYTA CHAQIRMA, shunchaki tabiiy javob ber.",
         parameters=types.Schema(
             type=types.Type.OBJECT,
             properties={
@@ -1073,7 +1073,13 @@ DEVICE_ACTION_DECLARATIONS = [
     ),
     types.FunctionDeclaration(
         name="open_telegram_chat",
-        description="Telegram'da ma'lum bir kishi/username bilan suhbatni ochish, ixtiyoriy ravishda xabar matnini tayyorlab qo'yish. 'Telegram'da Aliyevga yoz: ...', 'Vali bilan suhbatni och' kabi so'rovlarda ishlatiladi. Foydalanuvchi baribir Yuborish tugmasini bosishi kerak (avtomatik yuborilmaydi).",
+        description=(
+            "Telegram'da ma'lum bir kishi, kanal yoki guruhni ochish, ixtiyoriy ravishda xabar matnini tayyorlab qo'yish. "
+            "Quyidagilarning HAMMASIDA ishlatiladi: 'Telegram'dan <kanal>ga kir', '<kishi> bilan suhbatni och', "
+            "'Telegram'da <kimga> yoz: ...', '<kanal>ni och'. "
+            "Agar @username aniq aytilmasa, kanal/kishi nomini username sifatida yoz (masalan 'Mavzu' kanali -> 'mavzu'). "
+            "Foydalanuvchi baribir Yuborish tugmasini bosishi kerak (xabar avtomatik yuborilmaydi) — buni tabiiy ayt."
+        ),
         parameters=types.Schema(
             type=types.Type.OBJECT,
             properties={
@@ -1164,8 +1170,10 @@ TELEFONNI BOSHQARISH (agar shu funksiyalar mavjud bo'lsa — Shoxa ilovasidasan)
 - "... och", "... kir", "... ochib ber" + ilova nomi → open_app. HECH IKKILANMA, albatta chaqir, faqat gapirib qo'ymagin.
 - Ilova ochish VA shu ilova ichida biror narsa qilish birga aytilsa (masalan "YouTube'da Daler Mansurov qo'shig'ini qidir") → search_in_app (app_name + query), open_app EMAS.
 - "Telegram'da <kimga> yoz/xabar yubor" → open_telegram_chat (username + message). Agar shaxs ismi aytilsa lekin @username noma'lum bo'lsa, contact_name sifatida ismni username maydoniga yoz.
+- "Telegram'dan <kanal/guruh>ga kir", "<kanal>ni och" → open_telegram_chat (kanal nomini username sifatida ber).
 - Qo'ng'iroq: raqam aytilsa phone_number, ism aytilsa (masalan "Onamga qo'ng'iroq qil") contact_name bilan make_call.
 - Bularning barchasi HAQIQIY telefonda amalga oshadi — sen faqat signal berasan, natijani "amalga oshirilmoqda" deb tabiiy ayt, "men buni qila olmayman" demagin.
+- MUHIM: bir amal (open_app/search_in_app/open_telegram_chat/make_call/set_alarm) bajarilgandan SO'NG, foydalanuvchi "xa", "rahmat", "zo'r", "eshitamiz", "yaxshi" kabi oddiy javob/tasdiq aytsa — HECH QANDAY funksiya chaqirma, faqat tabiiy, qisqa javob ber ("Marhamat!", "Yaxshi tinglang!" va h.k.). Faqat foydalanuvchi YANGI, aniq buyruq bersa qayta funksiya chaqir.
 
 Qoidalar:
 - Foydalanuvchi qaysi tilda gapirsa, o'sha tilda javob ber (asosan o'zbek).
