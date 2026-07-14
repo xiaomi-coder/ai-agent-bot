@@ -1719,7 +1719,11 @@ async def transcribe_audio(data: bytes, mime: str) -> str:
             types.Part.from_text(text=_TRANSCRIBE_PROMPT),
             types.Part.from_bytes(data=data, mime_type=mime),
         ],
-        config=types.GenerateContentConfig(temperature=0.0),
+        config=types.GenerateContentConfig(
+            temperature=0.0,
+            max_output_tokens=2048,
+            thinking_config=types.ThinkingConfig(thinking_budget=0),
+        ),
     )
     if not response.candidates:
         return ""
