@@ -233,8 +233,9 @@ async def fire_reminder(reminder_id: int, user_id: int, text: str):
     try:
         if BOT:
             await BOT.send_message(user_id, f"⏰ Eslatma: {text}")
-        with sqlite3.connect(DB_PATH) as db:
-            db.execute("UPDATE reminders SET sent = 1 WHERE id = ?", (reminder_id,))
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("UPDATE reminders SET sent = 1 WHERE id = %s", (reminder_id,))
     except Exception:
         logger.exception("Eslatma yuborishda xato")
 
@@ -1735,6 +1736,23 @@ async def transcribe_audio(data: bytes, mime: str) -> str:
     return _clean_transcript(raw)
 
 
+def _fetch_telegram_file(file_id: str) -> bytes:
+    """Faylni Telegramdan to'g'ridan-to'g'ri requests bilan yuklaydi.
+
+    aiogram sessiyasi (polling bilan bir xil ulanish) ba'zan get_file/download_file
+    da 60s timeout beryapti. requests alohida ulanish ochib, buni chetlab o'tadi.
+    """
+    base = f"https://api.telegram.org/bot{BOT_TOKEN}"
+    meta = requests.get(f"{base}/getFile", params={"file_id": file_id}, timeout=30)
+    meta.raise_for_status()
+    file_path = meta.json()["result"]["file_path"]
+    resp = requests.get(
+        f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}", timeout=60
+    )
+    resp.raise_for_status()
+    return resp.content
+
+
 @router.message(F.voice | F.audio)
 async def handle_voice(message: Message, bot: Bot):
     uid = message.from_user.id
@@ -1751,13 +1769,11 @@ async def handle_voice(message: Message, bot: Bot):
         if audio.file_size and audio.file_size > 20 * 1024 * 1024:
             await message.answer("Audio juda katta (20 MB dan oshmasin).")
             return
-        file = await bot.get_file(audio.file_id)
-        buf = io.BytesIO()
-        await bot.download_file(file.file_path, buf)
+        data = await asyncio.to_thread(_fetch_telegram_file, audio.file_id)
         mime = "audio/ogg" if message.voice else (audio.mime_type or "audio/mpeg")
 
         # Avval ovozni matnga o'giramiz
-        text = await transcribe_audio(buf.getvalue(), mime)
+        text = await transcribe_audio(data, mime)
         if not text:
             await message.answer("Ovozni tushunib bo'lmadi 😕 Iltimos qaytadan yuboring.")
             return
@@ -1782,9 +1798,7 @@ async def handle_photo(message: Message, bot: Bot):
     await bot.send_chat_action(message.chat.id, ChatAction.TYPING)
     try:
         photo = message.photo[-1]  # eng katta o'lcham
-        file = await bot.get_file(photo.file_id)
-        buf = io.BytesIO()
-        await bot.download_file(file.file_path, buf)
+        img_data = await asyncio.to_thread(_fetch_telegram_file, photo.file_id)
 
         caption = message.caption or ""
         instruction = (
@@ -1796,7 +1810,7 @@ async def handle_photo(message: Message, bot: Bot):
             instruction += f"\nFoydalanuvchi izohi: {caption}"
 
         parts = [
-            types.Part.from_bytes(data=buf.getvalue(), mime_type="image/jpeg"),
+            types.Part.from_bytes(data=img_data, mime_type="image/jpeg"),
             types.Part.from_text(text=instruction),
         ]
         await agent_respond(message, message.from_user.id, parts)
@@ -1826,10 +1840,7 @@ async def handle_document(message: Message, bot: Bot):
         return
 
     try:
-        file = await bot.get_file(doc.file_id)
-        buf = io.BytesIO()
-        await bot.download_file(file.file_path, buf)
-        data = buf.getvalue()
+        data = await asyncio.to_thread(_fetch_telegram_file, doc.file_id)
 
         instruction = caption or "Bu hujjatni tahlil qil, asosiy mazmunini va muhim nuqtalarini tushuntir."
 
