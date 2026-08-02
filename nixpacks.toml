@@ -1,0 +1,4 @@
+# Railway (Nixpacks) qo'shimcha paketlar
+# ffmpeg — TTS javobni Telegram voice bubble (OGG/Opus) formatiga o'girish uchun
+[phases.setup]
+nixPkgs = ["...", "ffmpeg"]

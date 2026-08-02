@@ -30,7 +30,8 @@ from aiogram import Bot, Dispatcher, F, Router
 from aiogram.enums import ChatAction
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
-    Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, BufferedInputFile
+    Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, BufferedInputFile,
+    BotCommand,
 )
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from dotenv import load_dotenv
@@ -118,6 +119,7 @@ def db_init():
                 )
             """)
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS approved BOOLEAN NOT NULL DEFAULT FALSE")
+            cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS reply_mode TEXT NOT NULL DEFAULT 'text'")
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS profiles (
                     user_id BIGINT PRIMARY KEY,
@@ -384,6 +386,23 @@ def db_track_user(user_id: int, username: str | None, full_name: str):
                     last_seen = NOW(),
                     message_count = users.message_count + 1
             """, (user_id, username, full_name))
+
+
+def db_get_reply_mode(user_id: int) -> str:
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT reply_mode FROM users WHERE user_id = %s", (user_id,))
+            row = cur.fetchone()
+    return (row["reply_mode"] if row and row.get("reply_mode") else "text")
+
+
+def db_set_reply_mode(user_id: int, mode: str):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO users (user_id, reply_mode) VALUES (%s, %s)
+                ON CONFLICT (user_id) DO UPDATE SET reply_mode = EXCLUDED.reply_mode
+            """, (user_id, mode))
 
 
 def db_admin_stats() -> str:
@@ -815,6 +834,21 @@ def do_tts(text: str) -> bytes | None:
                 return _pcm_to_wav(part.inline_data.data)
     except Exception:
         logger.exception("TTS xato")
+    return None
+
+
+def _wav_to_ogg(wav: bytes) -> bytes | None:
+    """WAV ni Telegram voice bubble uchun OGG/Opus ga o'giradi (ffmpeg bo'lsa)."""
+    import subprocess
+    try:
+        p = subprocess.run(
+            ["ffmpeg", "-i", "pipe:0", "-c:a", "libopus", "-b:a", "48k", "-f", "ogg", "pipe:1"],
+            input=wav, capture_output=True, timeout=60,
+        )
+        if p.returncode == 0 and p.stdout:
+            return p.stdout
+    except Exception:
+        pass  # ffmpeg yo'q bo'lsa — WAV'ni audio fayl sifatida yuboramiz
     return None
 
 
@@ -1521,8 +1555,45 @@ async def ask_agent(
     return answer
 
 
+def _detect_reply_override(text: str) -> str | None:
+    """Foydalanuvchi shu xabarda javob turini so'ragan bo'lsa — aniqlaymiz.
+    Masalan: "matnda javob ber" -> text, "ovozli xabarda javob ber" -> voice."""
+    t = text.lower()
+    text_kw = (
+        "matnda javob", "matn bilan javob", "matnda ber", "matnda yoz",
+        "yozib javob", "yozma javob", "matnli javob", "tekstda javob", "matnda ayt",
+    )
+    voice_kw = (
+        "ovozli javob", "ovozda javob", "ovozli xabarda", "ovoz bilan javob",
+        "golosda javob", "golos bilan javob", "audio javob", "ovozli qilib", "ovozda ayt",
+    )
+    if any(k in t for k in text_kw):
+        return "text"
+    if any(k in t for k in voice_kw):
+        return "voice"
+    return None
+
+
+async def _reply_with_voice(message: Message, answer: str) -> bool:
+    """Javobni ovozga aylantirib yuboradi. Muvaffaqiyatli bo'lsa True."""
+    tts_text = answer[:1500]  # juda uzun matnni ovozga o'girish sekin va qimmat
+    wav = await asyncio.to_thread(do_tts, tts_text)
+    if not wav:
+        return False
+    ogg = await asyncio.to_thread(_wav_to_ogg, wav)
+    try:
+        if ogg:
+            await message.answer_voice(BufferedInputFile(ogg, "javob.ogg"))
+        else:
+            await message.answer_audio(BufferedInputFile(wav, "javob.wav"), title="Javob")
+        return True
+    except Exception:
+        logger.exception("Ovozli javob yuborishda xato")
+        return False
+
+
 async def agent_respond(message: Message, uid: int, parts: list[types.Part]):
-    """Agentdan javob olib, rasm bo'lsa rasmni, matnni yuboradi."""
+    """Agentdan javob olib, foydalanuvchi tanloviga qarab matn yoki ovozda yuboradi."""
     images: list = []
     answer = await ask_agent(uid, parts, images)
     for cap, img in images:
@@ -1533,8 +1604,25 @@ async def agent_respond(message: Message, uid: int, parts: list[types.Part]):
             )
         except Exception:
             logger.exception("Rasm yuborishda xato")
-    if answer:
-        await send_long(message, answer)
+    if not answer:
+        return
+
+    # Javob turi: shu xabardagi buyruq > profil sozlamasi
+    user_text = " ".join(p.text for p in parts if p.text)
+    mode = _detect_reply_override(user_text)
+    if mode is None:
+        mode = await asyncio.to_thread(db_get_reply_mode, uid)
+
+    if mode == "voice":
+        sent = await _reply_with_voice(message, answer)
+        if sent:
+            if len(answer) > 1500:
+                # Ovozga sig'magan qismi yo'qolmasligi uchun to'liq matnni ham yuboramiz
+                await send_long(message, answer)
+            return
+        # TTS ishlamasa — matnga tushamiz
+
+    await send_long(message, answer)
 
 
 # ============================================================
@@ -1758,6 +1846,44 @@ async def cmd_clear(message: Message):
     chat_history.pop(message.from_user.id, None)
     await asyncio.to_thread(db_clear_history, message.from_user.id)
     await message.answer("Suhbat tarixi tozalandi ✅")
+
+
+def settings_keyboard(mode: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(
+            text=("✅ " if mode == "text" else "") + "📝 Matnli javob",
+            callback_data="mode_text",
+        ),
+        InlineKeyboardButton(
+            text=("✅ " if mode == "voice" else "") + "🔊 Ovozli javob",
+            callback_data="mode_voice",
+        ),
+    ]])
+
+
+@router.message(Command("sozlamalar"))
+async def cmd_settings(message: Message):
+    mode = await asyncio.to_thread(db_get_reply_mode, message.from_user.id)
+    await message.answer(
+        "⚙️ Sozlamalar\n\nMen javoblarni qanday beray?\n"
+        "(Istalgan payt xabaringizda \"matnda javob ber\" yoki \"ovozli javob ber\" "
+        "desangiz — o'sha safar aytganingizcha qilaman.)",
+        reply_markup=settings_keyboard(mode),
+    )
+
+
+@router.callback_query(F.data.startswith("mode_"))
+async def mode_callback(callback: CallbackQuery):
+    mode = "voice" if callback.data == "mode_voice" else "text"
+    await asyncio.to_thread(db_set_reply_mode, callback.from_user.id, mode)
+    label = "🔊 Endi ovozli javob beraman." if mode == "voice" else "📝 Endi matnli javob beraman."
+    try:
+        await callback.message.edit_text(
+            f"⚙️ Sozlamalar\n\n{label}", reply_markup=settings_keyboard(mode),
+        )
+    except Exception:
+        pass  # xuddi shu tugma qayta bosilsa Telegram "not modified" beradi
+    await callback.answer("Saqlandi ✅")
 
 
 @router.message(Command("forget"))
@@ -2114,6 +2240,16 @@ async def main():
     dp.include_router(router)
     scheduler.start()
     restore_reminders()
+    try:
+        await BOT.set_my_commands([
+            BotCommand(command="start", description="Boshlash"),
+            BotCommand(command="sozlamalar", description="⚙️ Javob turi: matn / ovoz"),
+            BotCommand(command="hisobot", description="Oylik moliyaviy hisobot"),
+            BotCommand(command="eslatmalar", description="Faol eslatmalar"),
+            BotCommand(command="clear", description="Suhbat tarixini tozalash"),
+        ])
+    except Exception:
+        logger.exception("Komandalar menyusini o'rnatishda xato")
     logger.info("Shaxsiy yordamchi (v2) ishga tushdi...")
     await dp.start_polling(BOT)
 
