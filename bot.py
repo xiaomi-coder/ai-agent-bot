@@ -1172,13 +1172,17 @@ DEVICE_ACTION_DECLARATIONS = [
     ),
     types.FunctionDeclaration(
         name="set_alarm",
-        description="Telefonda budilnik/alarm o'rnatish. 'Ertalab 7 da budilnik qo'y', 'bu vaqtga uyg'otib qo'y' kabi so'rovlarda ishlatiladi.",
+        description="Telefonda budilnik/alarm o'rnatish. 'Ertalab 7 da budilnik qo'y', 'juma kuni 6 da uyg'otib qo'y' kabi so'rovlarda ishlatiladi.",
         parameters=types.Schema(
             type=types.Type.OBJECT,
             properties={
                 "hour": types.Schema(type=types.Type.INTEGER, description="Soat, 0-23 formatida"),
                 "minute": types.Schema(type=types.Type.INTEGER, description="Minut, 0-59"),
                 "label": types.Schema(type=types.Type.STRING, description="Budilnik nomi (ixtiyoriy)"),
+                "date": types.Schema(
+                    type=types.Type.STRING,
+                    description="Qaysi kunga — YYYY-MM-DD formatda (ixtiyoriy). 'Ertaga', 'juma kuni' kabi nisbiy kunlarni HOZIRGI VAQT asosida aniq sanaga aylantirib ber. Bugungi/eng yaqin vaqt bo'lsa bo'sh qoldir.",
+                ),
             },
             required=["hour", "minute"],
         ),
@@ -1533,6 +1537,7 @@ async def ask_agent(
                 device_action_sink.append({
                     "type": "set_alarm", "hour": hour, "minute": minute,
                     "label": args.get("label", ""),
+                    "date": args.get("date", ""),
                 })
                 result = f"Budilnik {hour:02d}:{minute:02d} ga o'rnatilmoqda."
             elif fc.name == "make_call" and device_action_sink is not None:
