@@ -18,6 +18,7 @@ import asyncio
 import io
 import logging
 import os
+import time
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -136,6 +137,18 @@ def db_init():
                     created_at TIMESTAMP NOT NULL DEFAULT NOW()
                 )
             """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS chat_history (
+                    id SERIAL PRIMARY KEY,
+                    user_id BIGINT NOT NULL,
+                    role TEXT NOT NULL,
+                    text TEXT NOT NULL,
+                    created_at TIMESTAMP NOT NULL DEFAULT NOW()
+                )
+            """)
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_chat_history_user ON chat_history(user_id, id)"
+            )
 
 
 # --- Buxgalteriya ---
@@ -519,6 +532,44 @@ def db_clear_memory(user_id: int) -> int:
         with conn.cursor() as cur:
             cur.execute("DELETE FROM long_memory WHERE user_id = %s", (user_id,))
             return cur.rowcount
+
+
+# --- Suhbat tarixi (deploy/restartda kontekst yo'qolmasligi uchun) ---
+
+def db_save_history_turn(user_id: int, role: str, text: str):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO chat_history (user_id, role, text) VALUES (%s, %s, %s)",
+                (user_id, role, text[:8000]),
+            )
+            # Har user uchun faqat oxirgi MAX_HISTORY*2 qatorni saqlaymiz
+            cur.execute(
+                """DELETE FROM chat_history WHERE user_id = %s AND id NOT IN (
+                       SELECT id FROM chat_history WHERE user_id = %s ORDER BY id DESC LIMIT %s
+                   )""",
+                (user_id, user_id, MAX_HISTORY * 2),
+            )
+
+
+def db_load_history(user_id: int) -> list:
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT role, text FROM chat_history WHERE user_id = %s ORDER BY id DESC LIMIT %s",
+                (user_id, MAX_HISTORY * 2),
+            )
+            rows = cur.fetchall()
+    return [
+        types.Content(role=r["role"], parts=[types.Part.from_text(text=r["text"])])
+        for r in reversed(rows)
+    ]
+
+
+def db_clear_history(user_id: int):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM chat_history WHERE user_id = %s", (user_id,))
 
 
 # ============================================================
@@ -1287,6 +1338,32 @@ MAX_HISTORY = 20
 chat_history: dict[int, list[types.Content]] = {}
 onboarding_state: dict[int, dict] = {}  # {user_id: {step, name, profession, interests, goals}}
 
+FALLBACK_MODEL = os.getenv("GEMINI_FALLBACK_MODEL", "gemini-2.5-flash-lite")
+
+
+def gemini_generate(model: str, contents, config=None):
+    """Gemini chaqiruvi: 2 urinish asosiy model, oxirgisi zaxira model bilan.
+    Xato ham, bo'sh javob ham qayta uriniladi — "Xatolik yuz berdi" kamayadi."""
+    last_exc: Exception | None = None
+    response = None
+    for attempt in range(3):
+        use_model = model if attempt < 2 else FALLBACK_MODEL
+        try:
+            response = client.models.generate_content(
+                model=use_model, contents=contents, config=config,
+            )
+            if response.candidates:
+                return response
+            logger.warning("Gemini bo'sh javob (%s, urinish %d)", use_model, attempt + 1)
+        except Exception as e:
+            last_exc = e
+            logger.warning("Gemini xato (%s, urinish %d): %s", use_model, attempt + 1, e)
+        if attempt < 2:
+            time.sleep(1 + attempt)
+    if response is not None:
+        return response
+    raise last_exc
+
 
 def _save_history(user_id: int, user_parts: list[types.Part], answer: str):
     """Foydalanuvchi xabari va javobni tarixga saqlaydi (kontekst saqlanishi uchun)."""
@@ -1296,6 +1373,13 @@ def _save_history(user_id: int, user_parts: list[types.Part], answer: str):
     history.append(types.Content(role="model", parts=[types.Part.from_text(text=answer)]))
     if len(history) > MAX_HISTORY * 2:
         chat_history[user_id] = history[-MAX_HISTORY * 2:]
+    # Postgres'ga ham yozamiz — deploy/restartda kontekst yo'qolmasligi uchun
+    try:
+        user_text = " ".join(p.text for p in saved if p.text).strip() or "[media xabar]"
+        db_save_history_turn(user_id, "user", user_text)
+        db_save_history_turn(user_id, "model", answer)
+    except Exception:
+        logger.exception("Tarixni bazaga yozishda xato")
 
 
 async def ask_agent(
@@ -1304,7 +1388,14 @@ async def ask_agent(
     image_sink: list | None = None,
     device_action_sink: list | None = None,
 ) -> str:
-    history = chat_history.setdefault(user_id, [])
+    # Birinchi murojaatda (yoki restartdan keyin) tarixni bazadan tiklaymiz
+    if user_id not in chat_history:
+        try:
+            chat_history[user_id] = await asyncio.to_thread(db_load_history, user_id)
+        except Exception:
+            logger.exception("Tarixni bazadan yuklashda xato")
+            chat_history[user_id] = []
+    history = chat_history[user_id]
     contents = history + [types.Content(role="user", parts=user_parts)]
 
     # device_action_sink berilgan bo'lsa — Shoxa ilovasidan kelgan so'rov,
@@ -1322,7 +1413,7 @@ async def ask_agent(
     answer = "Kechirasiz, javob topa olmadim. Boshqacharoq so'rab ko'ring."
     for _ in range(6):
         response = await asyncio.to_thread(
-            client.models.generate_content, model=MODEL, contents=contents, config=config,
+            gemini_generate, model=MODEL, contents=contents, config=config,
         )
         if not response.candidates:
             logger.warning("ask_agent: bo'sh candidates. prompt_feedback=%s", getattr(response, "prompt_feedback", None))
@@ -1426,7 +1517,7 @@ async def ask_agent(
         contents.append(types.Content(role="user", parts=result_parts))
 
     # Har qanday holatda ham kontekstni saqlaymiz
-    _save_history(user_id, user_parts, answer)
+    await asyncio.to_thread(_save_history, user_id, user_parts, answer)
     return answer
 
 
@@ -1665,6 +1756,7 @@ async def cmd_reminders(message: Message):
 @router.message(Command("clear"))
 async def cmd_clear(message: Message):
     chat_history.pop(message.from_user.id, None)
+    await asyncio.to_thread(db_clear_history, message.from_user.id)
     await message.answer("Suhbat tarixi tozalandi ✅")
 
 
@@ -1685,6 +1777,7 @@ async def cmd_forget(message: Message):
 async def forget_callback(callback: CallbackQuery):
     if callback.data == "forget_yes":
         chat_history.pop(callback.from_user.id, None)
+        await asyncio.to_thread(db_clear_history, callback.from_user.id)
         n = await asyncio.to_thread(db_clear_memory, callback.from_user.id)
         await callback.message.edit_text(f"Xotira tozalandi ✅ ({n} ta yozuv o'chirildi).")
     else:
@@ -1714,7 +1807,7 @@ def _clean_transcript(text: str) -> str:
 async def transcribe_audio(data: bytes, mime: str) -> str:
     """Gemini orqali audio ni matnga o'giradi."""
     response = await asyncio.to_thread(
-        client.models.generate_content,
+        gemini_generate,
         model=MODEL,
         contents=[
             types.Part.from_text(text=_TRANSCRIBE_PROMPT),
@@ -1961,10 +2054,62 @@ async def send_long(message: Message, text: str):
         await message.answer(text[i:i + 4000])
 
 
+# ============================================================
+# ADMIN OGOHLANTIRISHLARI (xato bo'lsa Telegram'da xabar keladi)
+# ============================================================
+
+async def _send_admin_alert(text: str):
+    try:
+        if BOT and ADMIN_ID:
+            await BOT.send_message(ADMIN_ID, text)
+    except Exception:
+        pass  # ogohlantirish yuborilmasa ham bot ishlashda davom etadi
+
+
+class AdminAlertHandler(logging.Handler):
+    """logger.error/exception bo'lganda adminga Telegram xabar yuboradi.
+    Bir xil xato 60 soniyada faqat 1 marta yuboriladi (flood bo'lmasligi uchun)."""
+
+    def __init__(self, loop: asyncio.AbstractEventLoop):
+        super().__init__(level=logging.ERROR)
+        self.loop = loop
+        self._last: dict[str, float] = {}
+
+    def emit(self, record: logging.LogRecord):
+        try:
+            if not BOT or not ADMIN_ID:
+                return
+            key = f"{record.name}:{record.getMessage()}"
+            now = time.time()
+            if now - self._last.get(key, 0.0) < 60:
+                return
+            self._last[key] = now
+            text = f"🚨 Xato: {record.getMessage()}"
+            if record.exc_info and record.exc_info[1] is not None:
+                text += f"\n{type(record.exc_info[1]).__name__}: {record.exc_info[1]}"
+            asyncio.run_coroutine_threadsafe(_send_admin_alert(text[:1000]), self.loop)
+        except Exception:
+            pass
+
+
+def _log_versions():
+    """Ishlayotgan kutubxona versiyalarini logga yozamiz — keyin aniq pin qilish oson bo'ladi."""
+    import importlib.metadata as md
+    for pkg in ("aiogram", "google-genai", "psycopg2-binary", "fastapi", "APScheduler"):
+        try:
+            logger.info("Versiya: %s==%s", pkg, md.version(pkg))
+        except Exception:
+            pass
+
+
 async def main():
     global BOT
     db_init()
+    _log_versions()
     BOT = Bot(token=BOT_TOKEN)
+    alert_handler = AdminAlertHandler(asyncio.get_running_loop())
+    logger.addHandler(alert_handler)
+    logging.getLogger("sirdosh-api").addHandler(alert_handler)
     dp = Dispatcher()
     dp.include_router(router)
     scheduler.start()
