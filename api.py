@@ -51,7 +51,10 @@ def _startup():
 
 def _check_auth(authorization: str | None):
     if not API_SECRET:
-        return  # kalit o'rnatilmagan bo'lsa, ochiq (faqat test uchun)
+        # Default YOPIQ: kalit o'rnatilmagan bo'lsa API ishlamaydi.
+        # (Aks holda istalgan odam istalgan user_id bilan kirib,
+        # o'zini avtomatik approve qilib olishi mumkin edi.)
+        raise HTTPException(status_code=503, detail="API o'chirilgan: API_SECRET o'rnatilmagan")
     token = (authorization or "").replace("Bearer ", "").strip()
     if token != API_SECRET:
         raise HTTPException(status_code=401, detail="Noto'g'ri API kaliti")
