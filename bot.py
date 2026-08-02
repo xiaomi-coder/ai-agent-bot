@@ -813,28 +813,34 @@ def _pcm_to_wav(pcm: bytes, rate: int = 24000, channels: int = 1, bits: int = 16
 
 
 def do_tts(text: str) -> bytes | None:
-    """Matnni tabiiy ovozga aylantiradi (WAV bytes)."""
-    try:
-        # TTS modelga aniq ko'rsatma beramiz — matnga javob bermasin, faqat o'qisin
-        resp = client.models.generate_content(
-            model=TTS_MODEL,
-            contents=f"Read aloud the following text exactly as written, in a natural warm tone: {text}",
-            config=types.GenerateContentConfig(
-                response_modalities=["AUDIO"],
-                speech_config=types.SpeechConfig(
-                    voice_config=types.VoiceConfig(
-                        prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=TTS_VOICE)
-                    )
+    """Matnni tabiiy ovozga aylantiradi (WAV bytes). Bo'sh javobda qayta urinadi."""
+    for attempt in range(2):
+        try:
+            # TTS modelga aniq ko'rsatma beramiz — matnga javob bermasin, faqat o'qisin
+            resp = client.models.generate_content(
+                model=TTS_MODEL,
+                contents=f"Read aloud the following text exactly as written, in a natural warm tone: {text}",
+                config=types.GenerateContentConfig(
+                    response_modalities=["AUDIO"],
+                    speech_config=types.SpeechConfig(
+                        voice_config=types.VoiceConfig(
+                            prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=TTS_VOICE)
+                        )
+                    ),
                 ),
-            ),
-        )
-        if not resp.candidates:
-            return None
-        for part in resp.candidates[0].content.parts:
-            if part.inline_data and part.inline_data.data:
-                return _pcm_to_wav(part.inline_data.data)
-    except Exception:
-        logger.exception("TTS xato")
+            )
+            cand = resp.candidates[0] if resp.candidates else None
+            parts = (cand.content.parts or []) if cand and cand.content else []
+            for part in parts:
+                if part.inline_data and part.inline_data.data:
+                    return _pcm_to_wav(part.inline_data.data)
+            logger.warning(
+                "TTS bo'sh javob (urinish %d). finish_reason=%s",
+                attempt + 1, getattr(cand, "finish_reason", None),
+            )
+        except Exception:
+            logger.exception("TTS xato")
+        time.sleep(1)
     return None
 
 
