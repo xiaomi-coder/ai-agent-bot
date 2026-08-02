@@ -151,6 +151,10 @@ def db_init():
             cur.execute(
                 "CREATE INDEX IF NOT EXISTS idx_chat_history_user ON chat_history(user_id, id)"
             )
+            # Ilovadagi "chatlar menyusi" uchun: har suhbat alohida kontekst (Telegram = 0)
+            cur.execute(
+                "ALTER TABLE chat_history ADD COLUMN IF NOT EXISTS chat_id BIGINT NOT NULL DEFAULT 0"
+            )
 
 
 # --- Buxgalteriya ---
@@ -554,29 +558,32 @@ def db_clear_memory(user_id: int) -> int:
 
 
 # --- Suhbat tarixi (deploy/restartda kontekst yo'qolmasligi uchun) ---
+# chat_id: Telegram doim 0; ilovada har suhbat o'z chat_id siga ega (ChatGPT uslubi)
 
-def db_save_history_turn(user_id: int, role: str, text: str):
+def db_save_history_turn(user_id: int, role: str, text: str, chat_id: int = 0):
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "INSERT INTO chat_history (user_id, role, text) VALUES (%s, %s, %s)",
-                (user_id, role, text[:8000]),
+                "INSERT INTO chat_history (user_id, role, text, chat_id) VALUES (%s, %s, %s, %s)",
+                (user_id, role, text[:8000], chat_id),
             )
-            # Har user uchun faqat oxirgi MAX_HISTORY*2 qatorni saqlaymiz
+            # Har suhbat uchun faqat oxirgi MAX_HISTORY*2 qatorni saqlaymiz
             cur.execute(
-                """DELETE FROM chat_history WHERE user_id = %s AND id NOT IN (
-                       SELECT id FROM chat_history WHERE user_id = %s ORDER BY id DESC LIMIT %s
+                """DELETE FROM chat_history WHERE user_id = %s AND chat_id = %s AND id NOT IN (
+                       SELECT id FROM chat_history WHERE user_id = %s AND chat_id = %s
+                       ORDER BY id DESC LIMIT %s
                    )""",
-                (user_id, user_id, MAX_HISTORY * 2),
+                (user_id, chat_id, user_id, chat_id, MAX_HISTORY * 2),
             )
 
 
-def db_load_history(user_id: int) -> list:
+def db_load_history(user_id: int, chat_id: int = 0) -> list:
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT role, text FROM chat_history WHERE user_id = %s ORDER BY id DESC LIMIT %s",
-                (user_id, MAX_HISTORY * 2),
+                """SELECT role, text FROM chat_history
+                   WHERE user_id = %s AND chat_id = %s ORDER BY id DESC LIMIT %s""",
+                (user_id, chat_id, MAX_HISTORY * 2),
             )
             rows = cur.fetchall()
     return [
@@ -585,10 +592,17 @@ def db_load_history(user_id: int) -> list:
     ]
 
 
-def db_clear_history(user_id: int):
+def db_clear_history(user_id: int, chat_id: int | None = None):
+    """chat_id berilsa — faqat o'sha suhbat, berilmasa foydalanuvchining hamma suhbatlari."""
     with get_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute("DELETE FROM chat_history WHERE user_id = %s", (user_id,))
+            if chat_id is None:
+                cur.execute("DELETE FROM chat_history WHERE user_id = %s", (user_id,))
+            else:
+                cur.execute(
+                    "DELETE FROM chat_history WHERE user_id = %s AND chat_id = %s",
+                    (user_id, chat_id),
+                )
 
 
 # ============================================================
@@ -1377,7 +1391,8 @@ def execute_function(user_id: int, name: str, args: dict) -> str:
 # ============================================================
 
 MAX_HISTORY = 20
-chat_history: dict[int, list[types.Content]] = {}
+# Kalit: (user_id, chat_id). Telegram uchun chat_id doim 0, ilovada har suhbat alohida.
+chat_history: dict[tuple[int, int], list[types.Content]] = {}
 onboarding_state: dict[int, dict] = {}  # {user_id: {step, name, profession, interests, goals}}
 
 FALLBACK_MODEL = os.getenv("GEMINI_FALLBACK_MODEL", "gemini-2.5-flash-lite")
@@ -1407,19 +1422,20 @@ def gemini_generate(model: str, contents, config=None):
     raise last_exc
 
 
-def _save_history(user_id: int, user_parts: list[types.Part], answer: str):
+def _save_history(user_id: int, user_parts: list[types.Part], answer: str, chat_id: int = 0):
     """Foydalanuvchi xabari va javobni tarixga saqlaydi (kontekst saqlanishi uchun)."""
-    history = chat_history.setdefault(user_id, [])
+    key = (user_id, chat_id)
+    history = chat_history.setdefault(key, [])
     saved = [p if p.text else types.Part.from_text(text="[media xabar]") for p in user_parts]
     history.append(types.Content(role="user", parts=saved))
     history.append(types.Content(role="model", parts=[types.Part.from_text(text=answer)]))
     if len(history) > MAX_HISTORY * 2:
-        chat_history[user_id] = history[-MAX_HISTORY * 2:]
+        chat_history[key] = history[-MAX_HISTORY * 2:]
     # Postgres'ga ham yozamiz — deploy/restartda kontekst yo'qolmasligi uchun
     try:
         user_text = " ".join(p.text for p in saved if p.text).strip() or "[media xabar]"
-        db_save_history_turn(user_id, "user", user_text)
-        db_save_history_turn(user_id, "model", answer)
+        db_save_history_turn(user_id, "user", user_text, chat_id)
+        db_save_history_turn(user_id, "model", answer, chat_id)
     except Exception:
         logger.exception("Tarixni bazaga yozishda xato")
 
@@ -1429,15 +1445,17 @@ async def ask_agent(
     user_parts: list[types.Part],
     image_sink: list | None = None,
     device_action_sink: list | None = None,
+    chat_id: int = 0,
 ) -> str:
     # Birinchi murojaatda (yoki restartdan keyin) tarixni bazadan tiklaymiz
-    if user_id not in chat_history:
+    key = (user_id, chat_id)
+    if key not in chat_history:
         try:
-            chat_history[user_id] = await asyncio.to_thread(db_load_history, user_id)
+            chat_history[key] = await asyncio.to_thread(db_load_history, user_id, chat_id)
         except Exception:
             logger.exception("Tarixni bazadan yuklashda xato")
-            chat_history[user_id] = []
-    history = chat_history[user_id]
+            chat_history[key] = []
+    history = chat_history[key]
     contents = history + [types.Content(role="user", parts=user_parts)]
 
     # device_action_sink berilgan bo'lsa — Shoxa ilovasidan kelgan so'rov,
@@ -1559,7 +1577,7 @@ async def ask_agent(
         contents.append(types.Content(role="user", parts=result_parts))
 
     # Har qanday holatda ham kontekstni saqlaymiz
-    await asyncio.to_thread(_save_history, user_id, user_parts, answer)
+    await asyncio.to_thread(_save_history, user_id, user_parts, answer, chat_id)
     return answer
 
 
@@ -1851,8 +1869,8 @@ async def cmd_reminders(message: Message):
 
 @router.message(Command("clear"))
 async def cmd_clear(message: Message):
-    chat_history.pop(message.from_user.id, None)
-    await asyncio.to_thread(db_clear_history, message.from_user.id)
+    chat_history.pop((message.from_user.id, 0), None)
+    await asyncio.to_thread(db_clear_history, message.from_user.id, 0)
     await message.answer("Suhbat tarixi tozalandi ✅")
 
 
@@ -1910,9 +1928,11 @@ async def cmd_forget(message: Message):
 @router.callback_query(F.data.startswith("forget_"))
 async def forget_callback(callback: CallbackQuery):
     if callback.data == "forget_yes":
-        chat_history.pop(callback.from_user.id, None)
-        await asyncio.to_thread(db_clear_history, callback.from_user.id)
-        n = await asyncio.to_thread(db_clear_memory, callback.from_user.id)
+        uid = callback.from_user.id
+        for k in [k for k in chat_history if k[0] == uid]:
+            chat_history.pop(k, None)
+        await asyncio.to_thread(db_clear_history, uid)
+        n = await asyncio.to_thread(db_clear_memory, uid)
         await callback.message.edit_text(f"Xotira tozalandi ✅ ({n} ta yozuv o'chirildi).")
     else:
         await callback.message.edit_text("Bekor qilindi. Hech narsa o'chirilmadi 👍")

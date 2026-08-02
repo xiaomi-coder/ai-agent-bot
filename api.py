@@ -64,6 +64,7 @@ class ChatRequest(BaseModel):
     user_id: int
     text: str
     name: str | None = None
+    chat_id: int = 0  # ilovadagi suhbat raqami (ChatGPT uslubidagi chatlar menyusi)
 
 
 class ChatResponse(BaseModel):
@@ -84,7 +85,10 @@ async def chat(req: ChatRequest, authorization: str | None = Header(default=None
     bot.db_approve_user(req.user_id)
 
     actions: list = []
-    reply = await bot.ask_agent(req.user_id, [types.Part.from_text(text=req.text)], device_action_sink=actions)
+    reply = await bot.ask_agent(
+        req.user_id, [types.Part.from_text(text=req.text)],
+        device_action_sink=actions, chat_id=req.chat_id,
+    )
     return ChatResponse(reply=reply, actions=actions)
 
 
@@ -107,6 +111,7 @@ async def voice(
     user_id: int = Form(...),
     audio: UploadFile = File(...),
     name: str | None = Form(default=None),
+    chat_id: int = Form(default=0),
     authorization: str | None = Header(default=None),
 ):
     _check_auth(authorization)
@@ -122,5 +127,8 @@ async def voice(
         return {"transcript": "", "reply": "Ovozni tushunib bo'lmadi, qaytadan urinib ko'ring.", "actions": []}
 
     actions: list = []
-    reply = await bot.ask_agent(user_id, [types.Part.from_text(text=transcript)], device_action_sink=actions)
+    reply = await bot.ask_agent(
+        user_id, [types.Part.from_text(text=transcript)],
+        device_action_sink=actions, chat_id=chat_id,
+    )
     return {"transcript": transcript, "reply": reply, "actions": actions}
