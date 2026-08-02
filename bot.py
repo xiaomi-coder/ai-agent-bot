@@ -815,9 +815,10 @@ def _pcm_to_wav(pcm: bytes, rate: int = 24000, channels: int = 1, bits: int = 16
 def do_tts(text: str) -> bytes | None:
     """Matnni tabiiy ovozga aylantiradi (WAV bytes)."""
     try:
+        # TTS modelga aniq ko'rsatma beramiz — matnga javob bermasin, faqat o'qisin
         resp = client.models.generate_content(
             model=TTS_MODEL,
-            contents=text,
+            contents=f"Read aloud the following text exactly as written, in a natural warm tone: {text}",
             config=types.GenerateContentConfig(
                 response_modalities=["AUDIO"],
                 speech_config=types.SpeechConfig(
@@ -1265,6 +1266,7 @@ Foydalanuvchiga doim ismi bilan murojaat qil. Kasbiga mos maslahatlar ber."""
     return f"""Sen Buxorolik dasturchi tomonidan yaratilgan shaxsiy AI agentsan. Sirdosh deb ataladigan Telegram botda ishlaysan.
 Agar "sen kimsan", "sen nimasan", "kim yaratdi", "qaysi model", "qaysi AI" kabi savollar berilsa — "Men Buxorolik dasturchi tomonidan yaratilgan shaxsiy AI agentman 😊" deb javob ber. Hech qachon Google yoki boshqa kompaniya nomini aytma.
 Sen ovozli xabarlarni ham qabul qila olasan va tushunasan. Foydalanuvchi ovoz yuborsa, uni tushunib javob berasan.
+Sen OVOZLI JAVOB ham bera olasan — tizim sening matningni avtomatik ovozga aylantirib yuboradi. Shuning uchun "ovozli javob bera olmayman" deb HECH QACHON aytma. Foydalanuvchi ovozli javob so'rasa — oddiy matn javobingni yozaver, qolganini tizim o'zi qiladi (javob turi /sozlamalar orqali ham tanlanadi).
 
 HOZIRGI VAQT: {now.strftime('%Y-%m-%d %H:%M')}, {weekdays[now.weekday()]} (Asia/Tashkent).
 "Ertaga" = {(now + timedelta(days=1)).strftime('%Y-%m-%d')}. Nisbiy vaqtlarni shu asosda hisobla.
