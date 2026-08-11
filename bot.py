@@ -120,6 +120,7 @@ def db_init():
             """)
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS approved BOOLEAN NOT NULL DEFAULT FALSE")
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS reply_mode TEXT NOT NULL DEFAULT 'text'")
+            cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS business_auto BOOLEAN NOT NULL DEFAULT FALSE")
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS profiles (
                     user_id BIGINT PRIMARY KEY,
@@ -407,6 +408,23 @@ def db_set_reply_mode(user_id: int, mode: str):
                 INSERT INTO users (user_id, reply_mode) VALUES (%s, %s)
                 ON CONFLICT (user_id) DO UPDATE SET reply_mode = EXCLUDED.reply_mode
             """, (user_id, mode))
+
+
+def db_get_business_auto(user_id: int) -> bool:
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT business_auto FROM users WHERE user_id = %s", (user_id,))
+            row = cur.fetchone()
+    return bool(row and row.get("business_auto"))
+
+
+def db_set_business_auto(user_id: int, enabled: bool):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO users (user_id, business_auto) VALUES (%s, %s)
+                ON CONFLICT (user_id) DO UPDATE SET business_auto = EXCLUDED.business_auto
+            """, (user_id, enabled))
 
 
 def db_admin_stats() -> str:
@@ -1965,6 +1983,85 @@ async def forget_callback(callback: CallbackQuery):
     await callback.answer()
 
 
+# ============================================================
+# TELEGRAM BUSINESS — egasi nomidan avtomatik javob
+# ============================================================
+
+_business_owners: dict[str, int] = {}  # connection_id -> egasining user_id si
+
+
+async def _business_owner_id(bot: Bot, conn_id: str) -> int | None:
+    if conn_id in _business_owners:
+        return _business_owners[conn_id]
+    try:
+        conn = await bot.get_business_connection(conn_id)
+        _business_owners[conn_id] = conn.user.id
+        return conn.user.id
+    except Exception:
+        logger.exception("Business connection ma'lumotini olishda xato")
+        return None
+
+
+@router.message(Command("biznes"))
+async def cmd_business(message: Message):
+    uid = message.from_user.id
+    if not await asyncio.to_thread(db_is_approved, uid):
+        await message.answer("Botdan foydalanish uchun admin ruxsati kerak. /start bosing.")
+        return
+    enabled = not await asyncio.to_thread(db_get_business_auto, uid)
+    await asyncio.to_thread(db_set_business_auto, uid, enabled)
+    if enabled:
+        await message.answer(
+            "💼 Biznes avto-javob YOQILDI ✅\n\n"
+            "Endi botni Telegram Business'ga ulang:\n"
+            "1. Telegram → Sozlamalar → Telegram Business → Chatbotlar\n"
+            "2. Shu botni tanlang va qaysi suhbatlarga ruxsat berishni belgilang\n\n"
+            "Shundan so'ng sizga yozgan odamlarga men sizning nomingizdan "
+            "xushmuomala javob beraman. Har bir suhbatdosh bilan kontekstni alohida eslab qolaman.\n\n"
+            "O'chirish uchun: yana /biznes bosing.\n"
+            "(Eslatma: Telegram Business uchun Premium obuna kerak.)"
+        )
+    else:
+        await message.answer("💼 Biznes avto-javob O'CHIRILDI. Yana yoqish uchun: /biznes")
+
+
+@router.business_message(F.text)
+async def handle_business_message(message: Message, bot: Bot):
+    conn_id = message.business_connection_id
+    if not conn_id:
+        return
+    owner_id = await _business_owner_id(bot, conn_id)
+    if owner_id is None:
+        return
+    # Egasining o'zi yozgan xabari yoki bot xabari — javob bermaymiz
+    if not message.from_user or message.from_user.id == owner_id or message.from_user.is_bot:
+        return
+    if not await asyncio.to_thread(db_get_business_auto, owner_id):
+        return
+    if not await asyncio.to_thread(db_is_approved, owner_id):
+        return
+    try:
+        sender = message.from_user.full_name or "Suhbatdosh"
+        prompt = (
+            "[BIZNES AVTO-JAVOB] Hozir sen egang nomidan uning Telegram suhbatdoshiga javob beryapsan. "
+            f"Suhbatdosh ismi: {sender}. Quyida uning xabari. Egang nomidan (birinchi shaxsda), "
+            "xushmuomala, qisqa va ishbilarmon javob yoz. FAQAT javob matnini yoz — izoh, kirish so'z yozma. "
+            "Aniq bilmagan narsang bo'lsa, egang tez orada o'zi javob berishini ayt.\n\n"
+            f"Xabar: {message.text}"
+        )
+        # Har suhbatdosh bilan alohida kontekst (chat_id = suhbat raqami)
+        answer = await ask_agent(
+            owner_id, [types.Part.from_text(text=prompt)], chat_id=message.chat.id,
+        )
+        if answer:
+            await bot.send_message(
+                chat_id=message.chat.id, text=answer[:4000],
+                business_connection_id=conn_id,
+            )
+    except Exception:
+        logger.exception("Biznes avto-javobda xato")
+
+
 _TRANSCRIBE_PROMPT = (
     "TRANSKRIPSIYA VAZIFASI. Sen tarjimon emassan, faqat transkriptchisan.\n"
     "Quyidagi audioda inson nima gapirgan bo'lsa, FAQAT o'sha so'zlarni, xuddi shu tilda yoz.\n"
@@ -2298,6 +2395,7 @@ async def main():
         await BOT.set_my_commands([
             BotCommand(command="start", description="Boshlash"),
             BotCommand(command="sozlamalar", description="⚙️ Javob turi: matn / ovoz"),
+            BotCommand(command="biznes", description="💼 Avto-javob (Telegram Business)"),
             BotCommand(command="hisobot", description="Oylik moliyaviy hisobot"),
             BotCommand(command="eslatmalar", description="Faol eslatmalar"),
             BotCommand(command="clear", description="Suhbat tarixini tozalash"),
