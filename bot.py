@@ -121,6 +121,9 @@ def db_init():
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS approved BOOLEAN NOT NULL DEFAULT FALSE")
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS reply_mode TEXT NOT NULL DEFAULT 'text'")
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS business_auto BOOLEAN NOT NULL DEFAULT FALSE")
+            cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS business_info TEXT NOT NULL DEFAULT ''")
+            cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS business_hours TEXT NOT NULL DEFAULT ''")
+            cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS business_notify BOOLEAN NOT NULL DEFAULT TRUE")
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS profiles (
                     user_id BIGINT PRIMARY KEY,
@@ -410,21 +413,37 @@ def db_set_reply_mode(user_id: int, mode: str):
             """, (user_id, mode))
 
 
-def db_get_business_auto(user_id: int) -> bool:
+def db_get_business_profile(user_id: int) -> dict:
     with get_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT business_auto FROM users WHERE user_id = %s", (user_id,))
+            cur.execute(
+                "SELECT business_auto, business_info, business_hours, business_notify "
+                "FROM users WHERE user_id = %s",
+                (user_id,),
+            )
             row = cur.fetchone()
-    return bool(row and row.get("business_auto"))
+    if not row:
+        return {"business_auto": False, "business_info": "", "business_hours": "", "business_notify": True}
+    return {
+        "business_auto": bool(row.get("business_auto")),
+        "business_info": row.get("business_info") or "",
+        "business_hours": row.get("business_hours") or "",
+        "business_notify": bool(row.get("business_notify", True)),
+    }
 
 
-def db_set_business_auto(user_id: int, enabled: bool):
+_BUSINESS_FIELDS = ("business_auto", "business_info", "business_hours", "business_notify")
+
+
+def db_set_business_field(user_id: int, field: str, value):
+    if field not in _BUSINESS_FIELDS:
+        raise ValueError(f"Noto'g'ri maydon: {field}")
     with get_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute("""
-                INSERT INTO users (user_id, business_auto) VALUES (%s, %s)
-                ON CONFLICT (user_id) DO UPDATE SET business_auto = EXCLUDED.business_auto
-            """, (user_id, enabled))
+            cur.execute(f"""
+                INSERT INTO users (user_id, {field}) VALUES (%s, %s)
+                ON CONFLICT (user_id) DO UPDATE SET {field} = EXCLUDED.{field}
+            """, (user_id, value))
 
 
 def db_admin_stats() -> str:
@@ -2002,27 +2021,88 @@ async def _business_owner_id(bot: Bot, conn_id: str) -> int | None:
         return None
 
 
+business_setup_state: dict[int, str] = {}  # uid -> "info" | "hours"
+
+
+def business_keyboard(p: dict) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text=("🔴 Avto-javobni o'chirish" if p["business_auto"] else "🟢 Avto-javobni yoqish"),
+            callback_data="biz_toggle",
+        )],
+        [InlineKeyboardButton(text="📋 Biznes ma'lumotlari", callback_data="biz_info"),
+         InlineKeyboardButton(text="⏰ Ish vaqti", callback_data="biz_hours")],
+        [InlineKeyboardButton(
+            text=("🔔 Xabarnoma: yoniq" if p["business_notify"] else "🔕 Xabarnoma: o'chiq"),
+            callback_data="biz_notify",
+        )],
+    ])
+
+
+def business_panel_text(p: dict) -> str:
+    status = "🟢 YONIQ" if p["business_auto"] else "🔴 O'CHIQ"
+    info = p["business_info"] or "— kiritilmagan (tugmani bosib kiriting)"
+    if len(info) > 200:
+        info = info[:200] + "..."
+    hours = p["business_hours"] or "— cheklanmagan (doim javob beradi)"
+    return (
+        "💼 BIZNES PANEL\n\n"
+        f"Avto-javob: {status}\n"
+        f"Ish vaqti: {hours}\n"
+        f"Biznes ma'lumotlari: {info}\n\n"
+        "Qanday ishlaydi: sizga yozgan odamlarga men sizning nomingizdan, "
+        "biznes ma'lumotlaringiz asosida javob beraman. Har suhbatdosh bilan "
+        "kontekstni alohida eslab qolaman.\n\n"
+        "Ulash: Telegram → Sozlamalar → Telegram Business → Chatbotlar → shu bot.\n"
+        "(Telegram Business uchun Premium kerak.)"
+    )
+
+
 @router.message(Command("biznes"))
 async def cmd_business(message: Message):
     uid = message.from_user.id
     if not await asyncio.to_thread(db_is_approved, uid):
         await message.answer("Botdan foydalanish uchun admin ruxsati kerak. /start bosing.")
         return
-    enabled = not await asyncio.to_thread(db_get_business_auto, uid)
-    await asyncio.to_thread(db_set_business_auto, uid, enabled)
-    if enabled:
-        await message.answer(
-            "💼 Biznes avto-javob YOQILDI ✅\n\n"
-            "Endi botni Telegram Business'ga ulang:\n"
-            "1. Telegram → Sozlamalar → Telegram Business → Chatbotlar\n"
-            "2. Shu botni tanlang va qaysi suhbatlarga ruxsat berishni belgilang\n\n"
-            "Shundan so'ng sizga yozgan odamlarga men sizning nomingizdan "
-            "xushmuomala javob beraman. Har bir suhbatdosh bilan kontekstni alohida eslab qolaman.\n\n"
-            "O'chirish uchun: yana /biznes bosing.\n"
-            "(Eslatma: Telegram Business uchun Premium obuna kerak.)"
+    p = await asyncio.to_thread(db_get_business_profile, uid)
+    await message.answer(business_panel_text(p), reply_markup=business_keyboard(p))
+
+
+@router.callback_query(F.data.startswith("biz_"))
+async def business_callback(callback: CallbackQuery):
+    uid = callback.from_user.id
+    action = callback.data
+
+    if action == "biz_toggle" or action == "biz_notify":
+        field = "business_auto" if action == "biz_toggle" else "business_notify"
+        p = await asyncio.to_thread(db_get_business_profile, uid)
+        new_value = not p[field]
+        await asyncio.to_thread(db_set_business_field, uid, field, new_value)
+        p[field] = new_value
+        try:
+            await callback.message.edit_text(business_panel_text(p), reply_markup=business_keyboard(p))
+        except Exception:
+            pass
+        await callback.answer("Saqlandi ✅")
+
+    elif action == "biz_info":
+        business_setup_state[uid] = "info"
+        await callback.message.answer(
+            "📋 Biznesingiz haqida yozib yuboring — nima ish qilasiz, mahsulot/xizmatlar, "
+            "narxlar, manzil, yetkazib berish... Qancha batafsil bo'lsa, men mijozlarga "
+            "shuncha aniq javob beraman.\n\n"
+            "Bekor qilish uchun: «bekor» deb yozing."
         )
-    else:
-        await message.answer("💼 Biznes avto-javob O'CHIRILDI. Yana yoqish uchun: /biznes")
+        await callback.answer()
+
+    elif action == "biz_hours":
+        business_setup_state[uid] = "hours"
+        await callback.message.answer(
+            "⏰ Ish vaqtingizni yozing (masalan: 09:00-18:00, dam olish: yakshanba).\n"
+            "Ish vaqtidan tashqari kelgan xabarlarga buni hisobga olib javob beraman.\n\n"
+            "Bekor qilish uchun: «bekor» deb yozing."
+        )
+        await callback.answer()
 
 
 @router.business_message(F.text)
@@ -2036,28 +2116,60 @@ async def handle_business_message(message: Message, bot: Bot):
     # Egasining o'zi yozgan xabari yoki bot xabari — javob bermaymiz
     if not message.from_user or message.from_user.id == owner_id or message.from_user.is_bot:
         return
-    if not await asyncio.to_thread(db_get_business_auto, owner_id):
+    profile = await asyncio.to_thread(db_get_business_profile, owner_id)
+    if not profile["business_auto"]:
         return
     if not await asyncio.to_thread(db_is_approved, owner_id):
         return
     try:
         sender = message.from_user.full_name or "Suhbatdosh"
+
+        info_part = (
+            f"\n\nEGASINING BIZNESI HAQIDA (javoblaringni SHU ma'lumotga asosla, o'zingdan narx/shart to'qima):\n{profile['business_info']}"
+            if profile["business_info"] else
+            "\n\nEgasi biznes ma'lumotlarini kiritmagan — umumiy xushmuomala javob ber, aniq savollar bo'lsa egasi tez orada javob berishini ayt."
+        )
+        hours_part = ""
+        if profile["business_hours"]:
+            hours_part = (
+                f"\nIsh vaqti: {profile['business_hours']}. Hozir: {now_local().strftime('%H:%M, %A')}. "
+                "Agar hozir ish vaqtidan tashqari bo'lsa — buni nazokat bilan aytib, "
+                "ish vaqtida to'liq javob berilishini bildir (lekin oddiy savollarga baribir javob ber)."
+            )
+
         prompt = (
-            "[BIZNES AVTO-JAVOB] Hozir sen egang nomidan uning Telegram suhbatdoshiga javob beryapsan. "
-            f"Suhbatdosh ismi: {sender}. Quyida uning xabari. Egang nomidan (birinchi shaxsda), "
-            "xushmuomala, qisqa va ishbilarmon javob yoz. FAQAT javob matnini yoz — izoh, kirish so'z yozma. "
-            "Aniq bilmagan narsang bo'lsa, egang tez orada o'zi javob berishini ayt.\n\n"
-            f"Xabar: {message.text}"
+            "[BIZNES AVTO-JAVOB] Sen egang nomidan uning Telegram suhbatdoshiga javob beryapsan. "
+            f"Suhbatdosh: {sender}.\n"
+            "QOIDALAR:\n"
+            "- Egang nomidan (birinchi shaxsda), xushmuomala, professional va QISQA javob ber.\n"
+            "- FAQAT javob matnini yoz — izoh, kirish so'z, variantlar yozma.\n"
+            "- Shikoyat bo'lsa: samimiy uzr so'ra, masala egasiga yetkazilishini va tez orada hal bo'lishini ayt.\n"
+            "- Buyurtma/narx so'ralsa: faqat biznes ma'lumotlaridagi narxlarni ayt; noma'lum bo'lsa egasi aniqlashtirishini ayt.\n"
+            "- Aniq bilmagan narsangni to'qima — egasi tez orada o'zi javob berishini ayt."
+            f"{info_part}{hours_part}\n\n"
+            f"Suhbatdoshning xabari: {message.text}"
         )
         # Har suhbatdosh bilan alohida kontekst (chat_id = suhbat raqami)
         answer = await ask_agent(
             owner_id, [types.Part.from_text(text=prompt)], chat_id=message.chat.id,
         )
-        if answer:
-            await bot.send_message(
-                chat_id=message.chat.id, text=answer[:4000],
-                business_connection_id=conn_id,
-            )
+        if not answer:
+            return
+        await bot.send_message(
+            chat_id=message.chat.id, text=answer[:4000],
+            business_connection_id=conn_id,
+        )
+        # Egasiga xabarnoma: kim yozdi, nima deb javob berdim
+        if profile["business_notify"]:
+            try:
+                uname = f" (@{message.from_user.username})" if message.from_user.username else ""
+                await bot.send_message(
+                    owner_id,
+                    f"💼 {sender}{uname} sizga yozdi:\n«{message.text[:300]}»\n\n"
+                    f"Men javob berdim:\n«{answer[:300]}»",
+                )
+            except Exception:
+                logger.exception("Egasiga xabarnoma yuborishda xato")
     except Exception:
         logger.exception("Biznes avto-javobda xato")
 
@@ -2252,6 +2364,24 @@ async def handle_document(message: Message, bot: Bot):
 @router.message(F.text)
 async def handle_text(message: Message, bot: Bot):
     uid = message.from_user.id
+
+    # Biznes panel sozlash jarayoni (/biznes -> ma'lumot yoki ish vaqti kiritish)
+    if uid in business_setup_state:
+        field = business_setup_state.pop(uid)
+        text = message.text.strip()
+        if text.lower() in ("bekor", "bekor qilish", "cancel", "отмена"):
+            await message.answer("Bekor qilindi 👍")
+            return
+        if field == "info":
+            await asyncio.to_thread(db_set_business_field, uid, "business_info", text[:3000])
+            await message.answer(
+                "📋 Biznes ma'lumotlari saqlandi! Endi mijozlarga shu asosda javob beraman.\n"
+                "Panelga qaytish: /biznes"
+            )
+        else:
+            await asyncio.to_thread(db_set_business_field, uid, "business_hours", text[:100])
+            await message.answer("⏰ Ish vaqti saqlandi!\nPanelga qaytish: /biznes")
+        return
 
     # Onboarding jarayoni
     if uid in onboarding_state:
