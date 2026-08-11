@@ -1292,6 +1292,13 @@ Agar "sen kimsan", "sen nimasan", "kim yaratdi", "qaysi model", "qaysi AI" kabi 
 Sen ovozli xabarlarni ham qabul qila olasan va tushunasan. Foydalanuvchi ovoz yuborsa, uni tushunib javob berasan.
 Sen OVOZLI JAVOB ham bera olasan — tizim sening matningni avtomatik ovozga aylantirib yuboradi. Shuning uchun "ovozli javob bera olmayman" deb HECH QACHON aytma. Foydalanuvchi ovozli javob so'rasa — oddiy matn javobingni yozaver, qolganini tizim o'zi qiladi (javob turi /sozlamalar orqali ham tanlanadi).
 
+EGASI NOMIDAN JAVOB YOZISH (juda muhim!):
+- Foydalanuvchi birovning xabarini ko'rsatib "mening o'rnimga javob yozib ber", "shunga javob yoz", "shu xabarga javob tayyorla" desa — FAQAT TAYYOR JAVOB MATNINI yoz, boshqa HECH NARSA yozma.
+- "Mana javob:", "Quyidagicha javob berishingiz mumkin:", izoh, variantlar, tushuntirish — TAQIQLANADI. Foydalanuvchi sening xabaringni to'g'ridan-to'g'ri nusxalab/forward qilib yuboradi, shuning uchun javob yuborishga tayyor holda bo'lsin.
+- Javob foydalanuvchi nomidan (birinchi shaxsda) yoziladi, uning uslubi va vaziyatga mos ohangda.
+- Ovozda so'ralsa ham xuddi shunday faqat javob matnini yoz — tizim o'zi ovozga aylantiradi.
+- Umumiy qoida: barcha javoblaring keraksiz kirish gaplarsiz, to'g'ridan-to'g'ri va aniq bo'lsin.
+
 HOZIRGI VAQT: {now.strftime('%Y-%m-%d %H:%M')}, {weekdays[now.weekday()]} (Asia/Tashkent).
 "Ertaga" = {(now + timedelta(days=1)).strftime('%Y-%m-%d')}. Nisbiy vaqtlarni shu asosda hisobla.
 
@@ -1586,17 +1593,31 @@ async def ask_agent(
     return answer
 
 
+_CYR2LAT = str.maketrans({
+    "а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e", "ё": "yo", "ж": "j",
+    "з": "z", "и": "i", "й": "y", "к": "k", "л": "l", "м": "m", "н": "n", "о": "o",
+    "п": "p", "р": "r", "с": "s", "т": "t", "у": "u", "ф": "f", "х": "x", "ц": "ts",
+    "ч": "ch", "ш": "sh", "щ": "sh", "ъ": "", "ь": "", "э": "e", "ю": "yu", "я": "ya",
+    "ў": "o'", "қ": "q", "ғ": "g'", "ҳ": "h",
+})
+
+
 def _detect_reply_override(text: str) -> str | None:
     """Foydalanuvchi shu xabarda javob turini so'ragan bo'lsa — aniqlaymiz.
-    Masalan: "matnda javob ber" -> text, "ovozli xabarda javob ber" -> voice."""
-    t = text.lower()
+    Masalan: "matnda javob ber" -> text, "ovozli xabarda javob ber" -> voice.
+    Kirillcha yozilgan bo'lsa ham tushunadi."""
+    t = text.lower().translate(_CYR2LAT)
     text_kw = (
         "matnda javob", "matn bilan javob", "matnda ber", "matnda yoz",
         "yozib javob", "yozma javob", "matnli javob", "tekstda javob", "matnda ayt",
+        "matn tarzida", "tekst tarzida", "matn shaklida", "matn ko'rinishida",
+        "matnda qaytar", "yozuvda javob",
     )
     voice_kw = (
         "ovozli javob", "ovozda javob", "ovozli xabarda", "ovoz bilan javob",
         "golosda javob", "golos bilan javob", "audio javob", "ovozli qilib", "ovozda ayt",
+        "ovozli xabar tarzida", "ovozli xabar bilan", "ovozli xabar qilib",
+        "ovoz tarzida", "ovoz shaklida", "ovozda qaytar", "ovozda ber", "golosda ayt",
     )
     if any(k in t for k in text_kw):
         return "text"
