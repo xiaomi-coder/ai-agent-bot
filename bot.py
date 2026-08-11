@@ -1494,6 +1494,8 @@ async def ask_agent(
     image_sink: list | None = None,
     device_action_sink: list | None = None,
     chat_id: int = 0,
+    system_prompt: str | None = None,
+    allow_tools: bool = True,
 ) -> str:
     # Birinchi murojaatda (yoki restartdan keyin) tarixni bazadan tiklaymiz
     key = (user_id, chat_id)
@@ -1508,14 +1510,18 @@ async def ask_agent(
 
     # device_action_sink berilgan bo'lsa — Shoxa ilovasidan kelgan so'rov,
     # telefonni boshqarish funksiyalarini ham yoqamiz.
-    declarations = FUNCTION_DECLARATIONS + (DEVICE_ACTION_DECLARATIONS if device_action_sink is not None else [])
+    # allow_tools=False — biznes avto-javob kabi begona suhbatdoshlar uchun:
+    # ular egasining moliya/eslatma funksiyalariga tega olmasligi kerak.
+    declarations = (
+        FUNCTION_DECLARATIONS + (DEVICE_ACTION_DECLARATIONS if device_action_sink is not None else [])
+    ) if allow_tools else []
 
     config = types.GenerateContentConfig(
-        system_instruction=build_system_prompt(user_id),
+        system_instruction=system_prompt or build_system_prompt(user_id),
         temperature=0.7,
         max_output_tokens=2048,
         thinking_config=types.ThinkingConfig(thinking_budget=0),
-        tools=[types.Tool(function_declarations=declarations)],
+        tools=[types.Tool(function_declarations=declarations)] if declarations else None,
     )
 
     answer = "Kechirasiz, javob topa olmadim. Boshqacharoq so'rab ko'ring."
@@ -2124,34 +2130,44 @@ async def handle_business_message(message: Message, bot: Bot):
     try:
         sender = message.from_user.full_name or "Suhbatdosh"
 
+        # Egasining ismi — javoblar uning tilidan yoziladi
+        owner_profile = await asyncio.to_thread(db_get_profile, owner_id)
+        owner_name = (owner_profile or {}).get("name") or "xo'jayin"
+
         info_part = (
-            f"\n\nEGASINING BIZNESI HAQIDA (javoblaringni SHU ma'lumotga asosla, o'zingdan narx/shart to'qima):\n{profile['business_info']}"
+            f"\n\nBIZNES MA'LUMOTLARI (narx/shartlarni FAQAT shu yerdan ol, o'zingdan to'qima):\n{profile['business_info']}"
             if profile["business_info"] else
-            "\n\nEgasi biznes ma'lumotlarini kiritmagan — umumiy xushmuomala javob ber, aniq savollar bo'lsa egasi tez orada javob berishini ayt."
+            "\n\nBiznes ma'lumotlari kiritilmagan — aniq savollar (narx, shartlar) bo'lsa "
+            "'keyinroq aniq aytaman' deb javob ber."
         )
         hours_part = ""
         if profile["business_hours"]:
             hours_part = (
                 f"\nIsh vaqti: {profile['business_hours']}. Hozir: {now_local().strftime('%H:%M, %A')}. "
-                "Agar hozir ish vaqtidan tashqari bo'lsa — buni nazokat bilan aytib, "
-                "ish vaqtida to'liq javob berilishini bildir (lekin oddiy savollarga baribir javob ber)."
+                "Ish vaqtidan tashqari bo'lsa — buni tabiiy aytib, ish vaqtida to'liq javob berishingni bildir."
             )
 
-        prompt = (
-            "[BIZNES AVTO-JAVOB] Sen egang nomidan uning Telegram suhbatdoshiga javob beryapsan. "
-            f"Suhbatdosh: {sender}.\n"
-            "QOIDALAR:\n"
-            "- Egang nomidan (birinchi shaxsda), xushmuomala, professional va QISQA javob ber.\n"
-            "- FAQAT javob matnini yoz — izoh, kirish so'z, variantlar yozma.\n"
-            "- Shikoyat bo'lsa: samimiy uzr so'ra, masala egasiga yetkazilishini va tez orada hal bo'lishini ayt.\n"
-            "- Buyurtma/narx so'ralsa: faqat biznes ma'lumotlaridagi narxlarni ayt; noma'lum bo'lsa egasi aniqlashtirishini ayt.\n"
-            "- Aniq bilmagan narsangni to'qima — egasi tez orada o'zi javob berishini ayt."
+        system = (
+            f"Sen Telegram'da {owner_name} nomidan uning suhbatdoshlariga javob berasan. "
+            f"Suhbatdosh o'zini {owner_name} bilan gaplashyapman deb his qilishi kerak — "
+            "XUDDI U KABI, birinchi shaxsda, tabiiy va samimiy inson ohangida yoz.\n"
+            "QAT'IY QOIDALAR:\n"
+            "- O'zingni AI, bot, agent, yordamchi deb TANISHTIRMA va bunga ishora ham qilma.\n"
+            "- 'Sizga qanday yordam bera olaman?' kabi xizmat/call-center iboralarini ISHLATMA. "
+            "Oddiy odam kabi gaplash: salomga qisqa salom, savolga tabiiy javob.\n"
+            f"- 'Sen kimsan?' desa — {owner_name} ekaningni oddiy ayt.\n"
+            "- Javoblar QISQA bo'lsin — 1-3 jumla. Uzun rasmiy matn yozma.\n"
+            "- Shikoyat bo'lsa: samimiy uzr so'ra, 'tez orada o'zim hal qilaman' de.\n"
+            "- Aniq bilmagan narsangni to'qima — 'buni keyinroq aniq aytaman' de.\n"
+            "- Suhbatdosh qaysi tilda yozsa, o'sha tilda javob ber."
             f"{info_part}{hours_part}\n\n"
-            f"Suhbatdoshning xabari: {message.text}"
+            f"Hozirgi suhbatdosh: {sender}."
         )
-        # Har suhbatdosh bilan alohida kontekst (chat_id = suhbat raqami)
+        # Har suhbatdosh bilan alohida kontekst (chat_id = suhbat raqami).
+        # allow_tools=False — begona odam egasining funksiyalariga (moliya, eslatma...) tega olmaydi.
         answer = await ask_agent(
-            owner_id, [types.Part.from_text(text=prompt)], chat_id=message.chat.id,
+            owner_id, [types.Part.from_text(text=message.text)], chat_id=message.chat.id,
+            system_prompt=system, allow_tools=False,
         )
         if not answer:
             return
