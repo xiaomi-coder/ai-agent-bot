@@ -136,6 +136,16 @@ def db_init():
                 )
             """)
             cur.execute("""
+                CREATE TABLE IF NOT EXISTS business_log (
+                    id SERIAL PRIMARY KEY,
+                    owner_id BIGINT NOT NULL,
+                    chat_id BIGINT NOT NULL,
+                    sender TEXT,
+                    text TEXT,
+                    created_at TIMESTAMP NOT NULL DEFAULT NOW()
+                )
+            """)
+            cur.execute("""
                 CREATE TABLE IF NOT EXISTS profiles (
                     user_id BIGINT PRIMARY KEY,
                     name TEXT,
@@ -490,6 +500,38 @@ def db_list_business_chats(owner_id: int, limit: int = 10) -> list[dict]:
                 WHERE owner_id = %s ORDER BY last_seen DESC LIMIT %s
             """, (owner_id, limit))
             return list(cur.fetchall())
+
+
+def db_business_log_add(owner_id: int, chat_id: int, sender: str, text: str):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO business_log (owner_id, chat_id, sender, text) VALUES (%s, %s, %s, %s)",
+                (owner_id, chat_id, sender, text[:300]),
+            )
+
+
+def db_business_today(owner_id: int) -> list[dict]:
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT sender, text FROM business_log
+                WHERE owner_id = %s AND created_at >= CURRENT_DATE ORDER BY id
+            """, (owner_id,))
+            return list(cur.fetchall())
+
+
+def db_business_owners_with_auto() -> list[int]:
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT user_id FROM users WHERE business_auto = TRUE")
+            return [r["user_id"] for r in cur.fetchall()]
+
+
+def db_business_log_cleanup():
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM business_log WHERE created_at < NOW() - INTERVAL '30 days'")
 
 
 def db_admin_stats() -> str:
@@ -2154,6 +2196,69 @@ async def _business_owner_id(bot: Bot, conn_id: str) -> int | None:
 business_setup_state: dict[int, str] = {}  # uid -> "info" | "hours"
 
 
+async def send_business_summary_to(owner_id: int, on_demand: bool = False) -> bool:
+    """Bugungi biznes xulosani egasiga yuboradi. Xabar bo'lmasa faqat on_demand'da aytadi."""
+    rows = await asyncio.to_thread(db_business_today, owner_id)
+    if not rows:
+        if on_demand and BOT:
+            await BOT.send_message(owner_id, "📊 Bugun hech kim yozmagan.")
+        return False
+
+    per: dict[str, int] = {}
+    for r in rows:
+        s = r["sender"] or "Noma'lum"
+        per[s] = per.get(s, 0) + 1
+    top = sorted(per.items(), key=lambda x: -x[1])[:10]
+    lines = "\n".join(f"• {s}: {c} ta xabar" for s, c in top)
+
+    # AI mavzu xulosasi (buyurtma/shikoyat/narx so'rovlarini ajratib beradi)
+    digest = ""
+    try:
+        msgs = "\n".join(f"- {r['sender']}: {r['text']}" for r in rows[:50])
+        resp = await asyncio.to_thread(
+            gemini_generate, model=MODEL,
+            contents=(
+                "Quyida bugun biznes egasiga mijozlardan kelgan xabarlar. 2-3 jumlada asosiy "
+                "mavzularni xulosala — ayniqsa buyurtma, shikoyat, narx so'rovi bo'lsa alohida ayt. "
+                f"O'zbekcha, qisqa:\n{msgs}"
+            ),
+            config=types.GenerateContentConfig(
+                temperature=0.3, max_output_tokens=512,
+                thinking_config=types.ThinkingConfig(thinking_budget=0),
+            ),
+        )
+        if resp.candidates:
+            try:
+                digest = (resp.text or "").strip()
+            except Exception:
+                digest = ""
+    except Exception:
+        logger.exception("Biznes xulosa (AI) xato")
+
+    text = (
+        "📊 BUGUNGI BIZNES XULOSA\n\n"
+        f"👥 {len(per)} kishi yozdi, jami {len(rows)} ta xabar:\n{lines}"
+        + (f"\n\n🧠 Xulosa: {digest}" if digest else "")
+    )
+    if BOT:
+        await BOT.send_message(owner_id, text[:4000])
+    return True
+
+
+async def business_daily_job():
+    """Har kuni 21:00 da avto-javob yoqiq egalarga kunlik xulosa."""
+    try:
+        owners = await asyncio.to_thread(db_business_owners_with_auto)
+        for uid in owners:
+            try:
+                await send_business_summary_to(uid)
+            except Exception:
+                logger.exception("Kunlik biznes xulosa yuborishda xato (user %s)", uid)
+        await asyncio.to_thread(db_business_log_cleanup)
+    except Exception:
+        logger.exception("Kunlik biznes job xato")
+
+
 def business_keyboard(p: dict) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(
@@ -2166,6 +2271,7 @@ def business_keyboard(p: dict) -> InlineKeyboardMarkup:
             text=("🔔 Xabarnoma: yoniq" if p["business_notify"] else "🔕 Xabarnoma: o'chiq"),
             callback_data="biz_notify",
         )],
+        [InlineKeyboardButton(text="📊 Bugungi statistika", callback_data="biz_stats")],
     ])
 
 
@@ -2234,6 +2340,10 @@ async def business_callback(callback: CallbackQuery):
         )
         await callback.answer()
 
+    elif action == "biz_stats":
+        await callback.answer()
+        await send_business_summary_to(uid, on_demand=True)
+
 
 @router.business_message(F.text)
 async def handle_business_message(message: Message, bot: Bot):
@@ -2258,6 +2368,10 @@ async def handle_business_message(message: Message, bot: Bot):
         await asyncio.to_thread(
             db_upsert_business_chat, owner_id, message.chat.id, conn_id,
             sender, message.from_user.username,
+        )
+        # Kunlik statistika uchun jurnalga yozamiz
+        await asyncio.to_thread(
+            db_business_log_add, owner_id, message.chat.id, sender, message.text,
         )
 
         # Egasining ismi — javoblar uning tilidan yoziladi
@@ -2670,6 +2784,8 @@ async def main():
     dp.include_router(router)
     scheduler.start()
     restore_reminders()
+    # Har kuni 21:00 da biznes egalariga kunlik xulosa
+    scheduler.add_job(business_daily_job, "cron", hour=21, minute=0, id="biz_daily")
     try:
         await BOT.set_my_commands([
             BotCommand(command="start", description="Boshlash"),
