@@ -482,6 +482,16 @@ def db_find_business_chats(owner_id: int, query: str) -> list[dict]:
             return list(cur.fetchall())
 
 
+def db_list_business_chats(owner_id: int, limit: int = 10) -> list[dict]:
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT chat_id, conn_id, name, username FROM business_chats
+                WHERE owner_id = %s ORDER BY last_seen DESC LIMIT %s
+            """, (owner_id, limit))
+            return list(cur.fetchall())
+
+
 def db_admin_stats() -> str:
     with get_conn() as conn:
         with conn.cursor() as cur:
@@ -1246,6 +1256,11 @@ FUNCTION_DECLARATIONS = [
     ),
 ]
 
+# Biznes suhbatlar (begona suhbatdoshlar) uchun faqat XAVFSIZ, o'qish-only funksiyalar:
+# qidiruv, ob-havo, kurs. Egasining moliya/eslatma/qaydlariga tegadiganlar KIRMAYDI.
+_SAFE_BUSINESS_TOOL_NAMES = {"web_search", "get_weather", "get_crypto", "fetch_url"}
+SAFE_BUSINESS_DECLARATIONS = [d for d in FUNCTION_DECLARATIONS if d.name in _SAFE_BUSINESS_TOOL_NAMES]
+
 # Faqat Shoxa (Android ilova) orqali ishlaganda yoqiladi — Telegram'da emas,
 # chunki bular HAQIQIY telefonni boshqaradi, buni faqat ilova bajara oladi.
 DEVICE_ACTION_DECLARATIONS = [
@@ -1404,7 +1419,7 @@ Imkoniyatlaring:
 3. Buxgalteriya — xarajat/daromad aytilsa add_transaction. Hisobot so'ralsa get_report.
 4. Eslatmalar — set_reminder (vaqtni aniq 'YYYY-MM-DD HH:MM' ga aylantir).
 5. Qaydlar — "eslab qol" desa add_note, "nima edi?" desa find_notes.
-7. Suhbatdoshga xabar yuborish (send_business_message) — foydalanuvchi "X ga yozib yubor", "unga javob yubor", "xat yubor" desa SHU funksiyani chaqir (Telegram Business orqali uning nomidan haqiqiy xabar ketadi). QAT'IY: funksiya chaqirmasdan yoki natijasini olmasdan turib "yubordim" DEMA — bu yolg'on bo'ladi. Kimga yuborish noaniq bo'lsa, avval so'ra.
+7. Suhbatdoshga xabar yuborish (send_business_message) — foydalanuvchi "X ga yozib yubor", "unga javob yubor", "xat yubor" desa DARHOL SHU funksiyani chaqir (Telegram Business orqali uning nomidan haqiqiy xabar ketadi). Foydalanuvchi aytgan nomni (masalan "developer") recipient sifatida to'g'ridan-to'g'ri ber — o'zingcha "bu kim ekan" deb mulohaza yuritma, funksiya o'zi topadi yoki ro'yxatni qaytaradi. QAT'IY: funksiya chaqirmasdan turib "yubordim" DEMA — bu yolg'on bo'ladi.
 6. Rasmlar — chek/kvitansiya rasmi kelsa, summa va do'konni aniqlab add_transaction chaqir.
 
 TELEFONNI BOSHQARISH (agar shu funksiyalar mavjud bo'lsa — Shoxa ilovasidasan):
@@ -1553,6 +1568,7 @@ async def ask_agent(
     chat_id: int = 0,
     system_prompt: str | None = None,
     allow_tools: bool = True,
+    tools_override: list | None = None,
 ) -> str:
     # Birinchi murojaatda (yoki restartdan keyin) tarixni bazadan tiklaymiz
     key = (user_id, chat_id)
@@ -1569,9 +1585,12 @@ async def ask_agent(
     # telefonni boshqarish funksiyalarini ham yoqamiz.
     # allow_tools=False — biznes avto-javob kabi begona suhbatdoshlar uchun:
     # ular egasining moliya/eslatma funksiyalariga tega olmasligi kerak.
-    declarations = (
-        FUNCTION_DECLARATIONS + (DEVICE_ACTION_DECLARATIONS if device_action_sink is not None else [])
-    ) if allow_tools else []
+    if tools_override is not None:
+        declarations = tools_override
+    else:
+        declarations = (
+            FUNCTION_DECLARATIONS + (DEVICE_ACTION_DECLARATIONS if device_action_sink is not None else [])
+        ) if allow_tools else []
 
     config = types.GenerateContentConfig(
         system_instruction=system_prompt or build_system_prompt(user_id),
@@ -1637,10 +1656,22 @@ async def ask_agent(
                 else:
                     matches = await asyncio.to_thread(db_find_business_chats, user_id, recipient)
                     if not matches:
-                        result = (
-                            f"'{recipient}' nomli suhbatdosh topilmadi. Faqat sizga avval yozgan "
-                            "odamlarga yuborish mumkin (Telegram Business orqali)."
-                        )
+                        known = await asyncio.to_thread(db_list_business_chats, user_id)
+                        if known:
+                            names = ", ".join(
+                                f"{m['name']}" + (f" (@{m['username']})" if m["username"] else "")
+                                for m in known
+                            )
+                            result = (
+                                f"'{recipient}' topilmadi. Mavjud suhbatdoshlar: {names}. "
+                                "Shulardan birini tanlang."
+                            )
+                        else:
+                            result = (
+                                f"'{recipient}' topilmadi. Hozircha ro'yxat bo'sh — suhbatdosh sizga "
+                                "Telegram Business orqali kamida bitta xabar yozgan bo'lishi kerak, "
+                                "shundan keyin unga xabar yubora olaman."
+                            )
                     elif len(matches) > 1 and not any(
                         (m["name"] or "").lower() == recipient.lower()
                         or (m["username"] or "").lower() == recipient.lstrip("@").lower()
@@ -2247,26 +2278,29 @@ async def handle_business_message(message: Message, bot: Bot):
             )
 
         system = (
-            f"Sen Telegram'da {owner_name} nomidan uning suhbatdoshlariga javob berasan. "
-            f"Suhbatdosh o'zini {owner_name} bilan gaplashyapman deb his qilishi kerak — "
-            "XUDDI U KABI, birinchi shaxsda, tabiiy va samimiy inson ohangida yoz.\n"
+            f"SEN {owner_name.upper()}SAN — Telegram'da o'z suhbatdoshlaringga o'zing javob beryapsan. "
+            "Birinchi shaxsda, tabiiy, samimiy, xuddi oddiy insonday yoz.\n"
             "QAT'IY QOIDALAR:\n"
-            "- O'zingni AI, bot, agent, yordamchi deb TANISHTIRMA va bunga ishora ham qilma.\n"
-            "- 'Sizga qanday yordam bera olaman?' kabi xizmat/call-center iboralarini ISHLATMA. "
-            "Oddiy odam kabi gaplash: salomga qisqa salom, savolga tabiiy javob.\n"
-            f"- 'Sen kimsan?' desa — {owner_name} ekaningni oddiy ayt.\n"
-            "- Javoblar QISQA bo'lsin — 1-3 jumla. Uzun rasmiy matn yozma.\n"
+            f"- Sen AI, bot, agent yoki yordamchi EMASSAN — sen {owner_name}san. Bu so'zlarni og'zingga ham olma.\n"
+            f"- 'Sen kimsan?' desa — '{owner_name}man' de, vassalom. 'AI agentman' deyish QAT'IYAN TAQIQLANADI.\n"
+            "- DIQQAT: agar shu suhbat tarixida oldin o'zingni AI/agent deb aytgan bo'lsang — u XATO edi, "
+            "endi hech qachon takrorlama va o'sha uslubga ergashma.\n"
+            "- 'Sizga qanday yordam bera olaman?', 'Eshitaman', 'Savolingiz bormi?' kabi call-center "
+            "iboralari TAQIQLANADI. Oddiy odam kabi: salomga qisqa salom, savolga to'g'ridan-to'g'ri javob.\n"
+            "- Javoblar QISQA — 1-3 jumla, do'stona ohang.\n"
+            "- Umumiy savollarga (kurs, ob-havo, fakt) bilganingcha yoki web_search bilan aniq javob ber — "
+            "'keyinroq aytaman' deb qochma.\n"
+            "- FAQAT biznes narx/shartlari haqida aniq ma'lumot bo'lmasa — 'buni keyinroq aniqlab aytaman' de.\n"
             "- Shikoyat bo'lsa: samimiy uzr so'ra, 'tez orada o'zim hal qilaman' de.\n"
-            "- Aniq bilmagan narsangni to'qima — 'buni keyinroq aniq aytaman' de.\n"
             "- Suhbatdosh qaysi tilda yozsa, o'sha tilda javob ber."
             f"{info_part}{hours_part}\n\n"
             f"Hozirgi suhbatdosh: {sender}."
         )
         # Har suhbatdosh bilan alohida kontekst (chat_id = suhbat raqami).
-        # allow_tools=False — begona odam egasining funksiyalariga (moliya, eslatma...) tega olmaydi.
+        # Faqat xavfsiz funksiyalar — begona odam egasining moliya/eslatmalariga tega olmaydi.
         answer = await ask_agent(
             owner_id, [types.Part.from_text(text=message.text)], chat_id=message.chat.id,
-            system_prompt=system, allow_tools=False,
+            system_prompt=system, tools_override=SAFE_BUSINESS_DECLARATIONS,
         )
         if not answer:
             return
