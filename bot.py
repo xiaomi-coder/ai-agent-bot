@@ -125,6 +125,17 @@ def db_init():
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS business_hours TEXT NOT NULL DEFAULT ''")
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS business_notify BOOLEAN NOT NULL DEFAULT TRUE")
             cur.execute("""
+                CREATE TABLE IF NOT EXISTS business_chats (
+                    owner_id BIGINT NOT NULL,
+                    chat_id BIGINT NOT NULL,
+                    conn_id TEXT NOT NULL,
+                    name TEXT,
+                    username TEXT,
+                    last_seen TIMESTAMP NOT NULL DEFAULT NOW(),
+                    PRIMARY KEY (owner_id, chat_id)
+                )
+            """)
+            cur.execute("""
                 CREATE TABLE IF NOT EXISTS profiles (
                     user_id BIGINT PRIMARY KEY,
                     name TEXT,
@@ -444,6 +455,31 @@ def db_set_business_field(user_id: int, field: str, value):
                 INSERT INTO users (user_id, {field}) VALUES (%s, %s)
                 ON CONFLICT (user_id) DO UPDATE SET {field} = EXCLUDED.{field}
             """, (user_id, value))
+
+
+def db_upsert_business_chat(owner_id: int, chat_id: int, conn_id: str, name: str, username: str | None):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO business_chats (owner_id, chat_id, conn_id, name, username, last_seen)
+                VALUES (%s, %s, %s, %s, %s, NOW())
+                ON CONFLICT (owner_id, chat_id) DO UPDATE
+                SET conn_id = EXCLUDED.conn_id, name = EXCLUDED.name,
+                    username = EXCLUDED.username, last_seen = NOW()
+            """, (owner_id, chat_id, conn_id, name, username))
+
+
+def db_find_business_chats(owner_id: int, query: str) -> list[dict]:
+    """Ism yoki username bo'yicha suhbatdoshni qidiradi (oxirgi yozishganlar ichidan)."""
+    q = f"%{query.strip().lstrip('@')}%"
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT chat_id, conn_id, name, username FROM business_chats
+                WHERE owner_id = %s AND (name ILIKE %s OR username ILIKE %s)
+                ORDER BY last_seen DESC LIMIT 5
+            """, (owner_id, q, q))
+            return list(cur.fetchall())
 
 
 def db_admin_stats() -> str:
@@ -1084,6 +1120,26 @@ FUNCTION_DECLARATIONS = [
         ),
     ),
     types.FunctionDeclaration(
+        name="send_business_message",
+        description=(
+            "Egasining Telegram suhbatdoshiga (mijoz/kontakt) UNING NOMIDAN haqiqiy xabar yuborish. "
+            "Foydalanuvchi 'X ga yozib yubor', 'unga ... deb javob ber', 'xat yubor' desa SHU funksiyani chaqir. "
+            "Faqat oldin yozishgan suhbatdoshlarga yuborish mumkin (Telegram Business orqali). "
+            "MUHIM: bu funksiyani chaqirmasdan turib 'yubordim' dema!"
+        ),
+        parameters=types.Schema(
+            type=types.Type.OBJECT,
+            properties={
+                "recipient": types.Schema(
+                    type=types.Type.STRING,
+                    description="Suhbatdoshning ismi yoki @username (suhbat kontekstidan yoki foydalanuvchi aytganidan ol)",
+                ),
+                "message": types.Schema(type=types.Type.STRING, description="Yuboriladigan xabar matni"),
+            },
+            required=["recipient", "message"],
+        ),
+    ),
+    types.FunctionDeclaration(
         name="remember",
         description="Foydalanuvchi haqida MUHIM, uzoq muddat eslab qolish kerak bo'lgan faktni saqlash. Masalan: uning loyihasi, ishi, maqsadi, sevimli narsasi, oilasi, muhim sanalari, qarorlari. Foydalanuvchi o'zi haqida yangi muhim narsa aytsa — DARHOL shuni chaqir.",
         parameters=types.Schema(
@@ -1348,6 +1404,7 @@ Imkoniyatlaring:
 3. Buxgalteriya — xarajat/daromad aytilsa add_transaction. Hisobot so'ralsa get_report.
 4. Eslatmalar — set_reminder (vaqtni aniq 'YYYY-MM-DD HH:MM' ga aylantir).
 5. Qaydlar — "eslab qol" desa add_note, "nima edi?" desa find_notes.
+7. Suhbatdoshga xabar yuborish (send_business_message) — foydalanuvchi "X ga yozib yubor", "unga javob yubor", "xat yubor" desa SHU funksiyani chaqir (Telegram Business orqali uning nomidan haqiqiy xabar ketadi). QAT'IY: funksiya chaqirmasdan yoki natijasini olmasdan turib "yubordim" DEMA — bu yolg'on bo'ladi. Kimga yuborish noaniq bo'lsa, avval so'ra.
 6. Rasmlar — chek/kvitansiya rasmi kelsa, summa va do'konni aniqlab add_transaction chaqir.
 
 TELEFONNI BOSHQARISH (agar shu funksiyalar mavjud bo'lsa — Shoxa ilovasidasan):
@@ -1570,7 +1627,43 @@ async def ask_agent(
         result_parts = []
         for fc in function_calls:
             args = dict(fc.args or {})
-            if fc.name == "generate_image":
+            if fc.name == "send_business_message":
+                recipient = str(args.get("recipient", "")).strip()
+                msg_text = str(args.get("message", "")).strip()
+                if not recipient or not msg_text:
+                    result = "Xato: qabul qiluvchi yoki xabar matni bo'sh."
+                elif BOT is None:
+                    result = "Xato: bot hali tayyor emas, birozdan keyin urinib ko'ring."
+                else:
+                    matches = await asyncio.to_thread(db_find_business_chats, user_id, recipient)
+                    if not matches:
+                        result = (
+                            f"'{recipient}' nomli suhbatdosh topilmadi. Faqat sizga avval yozgan "
+                            "odamlarga yuborish mumkin (Telegram Business orqali)."
+                        )
+                    elif len(matches) > 1 and not any(
+                        (m["name"] or "").lower() == recipient.lower()
+                        or (m["username"] or "").lower() == recipient.lstrip("@").lower()
+                        for m in matches
+                    ):
+                        names = ", ".join(m["name"] or m["username"] or "?" for m in matches)
+                        result = f"Bir nechta mos suhbatdosh topildi: {names}. Qaysi biriga yuborishni aniqlashtiring."
+                    else:
+                        target = next(
+                            (m for m in matches if (m["name"] or "").lower() == recipient.lower()
+                             or (m["username"] or "").lower() == recipient.lstrip("@").lower()),
+                            matches[0],
+                        )
+                        try:
+                            await BOT.send_message(
+                                chat_id=target["chat_id"], text=msg_text[:4000],
+                                business_connection_id=target["conn_id"],
+                            )
+                            result = f"✅ Xabar {target['name'] or recipient} ga muvaffaqiyatli yuborildi."
+                        except Exception as e:
+                            logger.exception("Biznes xabar yuborishda xato")
+                            result = f"Xabar yuborib bo'lmadi: {e}"
+            elif fc.name == "generate_image":
                 prompt = args.get("prompt", "")
                 img = await asyncio.to_thread(do_generate_image, prompt)
                 if img is not None and image_sink is not None:
@@ -2129,6 +2222,12 @@ async def handle_business_message(message: Message, bot: Bot):
         return
     try:
         sender = message.from_user.full_name or "Suhbatdosh"
+
+        # Suhbatdoshni eslab qolamiz — keyin egasi "unga yozib yubor" deya oladi
+        await asyncio.to_thread(
+            db_upsert_business_chat, owner_id, message.chat.id, conn_id,
+            sender, message.from_user.username,
+        )
 
         # Egasining ismi — javoblar uning tilidan yoziladi
         owner_profile = await asyncio.to_thread(db_get_profile, owner_id)
