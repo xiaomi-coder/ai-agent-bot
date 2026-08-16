@@ -119,6 +119,11 @@ def db_init():
                 )
             """)
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS approved BOOLEAN NOT NULL DEFAULT FALSE")
+            # Snippet kutubxonasi: qaydlarga sarlavha, teglar, kod bloki (additiv)
+            cur.execute("ALTER TABLE notes ADD COLUMN IF NOT EXISTS title TEXT NOT NULL DEFAULT ''")
+            cur.execute("ALTER TABLE notes ADD COLUMN IF NOT EXISTS tags TEXT NOT NULL DEFAULT ''")
+            cur.execute("ALTER TABLE notes ADD COLUMN IF NOT EXISTS code TEXT NOT NULL DEFAULT ''")
+            cur.execute("ALTER TABLE notes ADD COLUMN IF NOT EXISTS lang TEXT NOT NULL DEFAULT ''")
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS reply_mode TEXT NOT NULL DEFAULT 'text'")
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS business_auto BOOLEAN NOT NULL DEFAULT FALSE")
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS business_info TEXT NOT NULL DEFAULT ''")
@@ -363,34 +368,96 @@ def restore_reminders():
 
 # --- Qaydlar ---
 
-def db_add_note(user_id: int, text: str) -> str:
+def _norm_tags(tags: str) -> str:
+    """'Railway, ffmpeg' -> 'railway,ffmpeg' (kichik harf, bo'shliqsiz, # belgisiz)."""
+    parts = [t.strip().lstrip("#").lower() for t in (tags or "").replace(";", ",").split(",")]
+    return ",".join(sorted({p for p in parts if p}))
+
+
+def db_add_note(user_id: int, text: str, title: str = "", tags: str = "", code: str = "", lang: str = "") -> str:
+    tags = _norm_tags(tags)
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "INSERT INTO notes (user_id, text) VALUES (%s, %s) RETURNING id",
-                (user_id, text),
+                "INSERT INTO notes (user_id, text, title, tags, code, lang) VALUES (%s, %s, %s, %s, %s, %s) RETURNING id",
+                (user_id, text or "", title[:120], tags, code, lang.lower()[:20]),
             )
             note_id = cur.fetchone()["id"]
-    return f"Eslab qoldim (№{note_id}): {text}"
+    label = title or (text[:60] if text else "kod snippeti")
+    tag_str = f" [{', '.join('#' + t for t in tags.split(','))}]" if tags else ""
+    kind = "Snippet" if code else "Qayd"
+    return f"{kind} saqlandi №{note_id}: {label}{tag_str}"
 
 
-def db_find_notes(user_id: int, query: str) -> str:
+def _format_note(r: dict, full: bool = True) -> str:
+    head = f"№{r['id']}"
+    if r.get("title"):
+        head += f" — {r['title']}"
+    tags = r.get("tags") or ""
+    if tags:
+        head += "  " + " ".join("#" + t for t in tags.split(","))
+    head += f"  ({str(r['created_at'])[:10]})"
+    out = head
+    if r.get("text"):
+        out += f"\n{r['text']}"
+    if r.get("code") and full:
+        out += f"\n```{r.get('lang') or ''}\n{r['code']}\n```"
+    elif r.get("code"):
+        first = r["code"].strip().splitlines()[0][:80] if r["code"].strip() else ""
+        out += f"\n<kod: {first}...>"
+    return out
+
+
+def db_find_notes(user_id: int, query: str = "", tag: str = "") -> str:
+    tag = _norm_tags(tag).split(",")[0] if tag else ""
     with get_conn() as conn:
         with conn.cursor() as cur:
+            conds, params = ["user_id = %s"], [user_id]
             if query:
-                cur.execute(
-                    "SELECT id, text, created_at FROM notes WHERE user_id = %s AND text ILIKE %s ORDER BY id DESC LIMIT 10",
-                    (user_id, f"%{query}%"),
-                )
-            else:
-                cur.execute(
-                    "SELECT id, text, created_at FROM notes WHERE user_id = %s ORDER BY id DESC LIMIT 10",
-                    (user_id,),
-                )
+                conds.append("(text ILIKE %s OR title ILIKE %s OR code ILIKE %s OR tags ILIKE %s)")
+                params += [f"%{query}%"] * 4
+            if tag:
+                conds.append("(',' || tags || ',') ILIKE %s")
+                params.append(f"%,{tag},%")
+            cur.execute(
+                f"SELECT id, text, title, tags, code, lang, created_at FROM notes "
+                f"WHERE {' AND '.join(conds)} ORDER BY id DESC LIMIT 10",
+                params,
+            )
             rows = cur.fetchall()
     if not rows:
-        return "Qaydlar topilmadi." if query else "Hali qaydlar yo'q."
-    return "Topilgan qaydlar:\n" + "\n".join(f"№{r['id']} ({str(r['created_at'])[:10]}): {r['text']}" for r in rows)
+        return "Qaydlar topilmadi." if (query or tag) else "Hali qaydlar yo'q."
+    # 1-2 ta natija bo'lsa to'liq (kod bilan), ko'p bo'lsa qisqa ro'yxat
+    full = len(rows) <= 2
+    body = "\n\n".join(_format_note(r, full=full) for r in rows)
+    hint = "" if full else "\n\nTo'liq ko'rish: qayd raqamini ayting (masalan «№12 ni ko'rsat»)."
+    return f"Topilgan qaydlar ({len(rows)}):\n\n{body}{hint}"
+
+
+def db_get_note(user_id: int, note_id: int) -> str:
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, text, title, tags, code, lang, created_at FROM notes WHERE id = %s AND user_id = %s",
+                (note_id, user_id),
+            )
+            r = cur.fetchone()
+    return _format_note(r, full=True) if r else f"№{note_id} qayd topilmadi."
+
+
+def db_list_tags(user_id: int) -> str:
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT tags FROM notes WHERE user_id = %s AND tags <> ''", (user_id,))
+            rows = cur.fetchall()
+    counts: dict[str, int] = {}
+    for r in rows:
+        for t in r["tags"].split(","):
+            counts[t] = counts.get(t, 0) + 1
+    if not counts:
+        return "Hali teglar yo'q. Qayd saqlaganda teg qo'shing: «eslab qol #railway ...»."
+    top = sorted(counts.items(), key=lambda x: (-x[1], x[0]))
+    return "Teglar:\n" + "\n".join(f"#{t} — {c} ta" for t, c in top)
 
 
 def db_delete_note(user_id: int, note_id: int) -> str:
@@ -1272,20 +1339,50 @@ FUNCTION_DECLARATIONS = [
     ),
     types.FunctionDeclaration(
         name="add_note",
-        description="Qayd saqlash. 'Eslab qol: ...' desa ishlatiladi (parollar, raqamlar, manzillar, fikrlar).",
+        description=(
+            "Qayd yoki KOD SNIPPETI saqlash. 'Eslab qol: ...', 'saqla', 'snippet qilib qo'y' desa ishlatiladi "
+            "(sozlamalar, buyruqlar, kod parchalari, parollar, raqamlar, fikrlar). "
+            "Xabarda kod bo'lsa — uni 'code' ga ajratib ber, tushuntirishni 'text' ga. "
+            "Teglarni foydalanuvchi #teg deb yozgan bo'lsa yoki mavzudan ravshan bo'lsa (masalan railway, python, kotlin) qo'sh."
+        ),
         parameters=types.Schema(
             type=types.Type.OBJECT,
-            properties={"text": types.Schema(type=types.Type.STRING, description="Saqlanadigan matn")},
-            required=["text"],
+            properties={
+                "text": types.Schema(type=types.Type.STRING, description="Tushuntirish/matn (kod bo'lmagan qism)"),
+                "title": types.Schema(type=types.Type.STRING, description="Qisqa sarlavha (3-6 so'z), keyin topish oson bo'lishi uchun"),
+                "tags": types.Schema(type=types.Type.STRING, description="Vergul bilan teglar, masalan: 'railway,ffmpeg' (# belgisiz)"),
+                "code": types.Schema(type=types.Type.STRING, description="Kod/buyruq/konfig parchasi — aynan, o'zgartirmasdan"),
+                "lang": types.Schema(type=types.Type.STRING, description="Kod tili: python, kotlin, bash, toml, sql, js... (ixtiyoriy)"),
+            },
         ),
     ),
     types.FunctionDeclaration(
         name="find_notes",
-        description="Saqlangan qaydlardan qidirish. 'Mashina raqami nima edi?' kabi savollarda. Bo'sh query = oxirgi qaydlar.",
+        description=(
+            "Saqlangan qaydlar/snippetlardan qidirish. 'Railway ffmpeg qanday edi?', 'kotlin snippetlarim', "
+            "'#python qaydlar' kabi so'rovlarda. Matn, sarlavha, kod va teglar bo'yicha qidiradi. Bo'sh = oxirgilari."
+        ),
         parameters=types.Schema(
             type=types.Type.OBJECT,
-            properties={"query": types.Schema(type=types.Type.STRING, description="Qidiruv so'zi (masalan: mashina)")},
+            properties={
+                "query": types.Schema(type=types.Type.STRING, description="Qidiruv so'zi (masalan: ffmpeg)"),
+                "tag": types.Schema(type=types.Type.STRING, description="Faqat shu teg bo'yicha (masalan: railway)"),
+            },
         ),
+    ),
+    types.FunctionDeclaration(
+        name="get_note",
+        description="Bitta qaydni raqami (№) bo'yicha TO'LIQ ko'rsatish — kod bloki bilan. '№12 ni ko'rsat', '12-qaydni ochib ber'.",
+        parameters=types.Schema(
+            type=types.Type.OBJECT,
+            properties={"note_id": types.Schema(type=types.Type.INTEGER)},
+            required=["note_id"],
+        ),
+    ),
+    types.FunctionDeclaration(
+        name="list_tags",
+        description="Foydalanuvchining barcha teglari va har birida nechta qayd borligi. 'Teglarim', 'qanday kategoriyalar bor' desa.",
+        parameters=types.Schema(type=types.Type.OBJECT, properties={}),
     ),
     types.FunctionDeclaration(
         name="delete_note",
@@ -1460,7 +1557,7 @@ Imkoniyatlaring:
    Hujjat (PDF/Word/Excel) — foydalanuvchi fayl yuborsa avtomatik o'qiysan va tahlil qilasan.
 3. Buxgalteriya — xarajat/daromad aytilsa add_transaction. Hisobot so'ralsa get_report.
 4. Eslatmalar — set_reminder (vaqtni aniq 'YYYY-MM-DD HH:MM' ga aylantir).
-5. Qaydlar — "eslab qol" desa add_note, "nima edi?" desa find_notes.
+5. Qaydlar va SNIPPET KUTUBXONASI — "eslab qol", "saqla", "snippet qil" desa add_note: xabarda kod/buyruq/konfig bo'lsa uni AYNAN, o'zgartirmasdan code'ga, tushuntirishni text'ga, qisqa title va mavzuga mos teglar (foydalanuvchi #teg yozgan bo'lsa shuni ol) ber. "... qanday edi?", "... snippetim", "#teg qaydlar" desa find_notes (query va/yoki tag). "№N ni ko'rsat" desa get_note. "teglarim" desa list_tags. Qayd natijasini (ayniqsa kod bloklarini) O'ZGARTIRMASDAN, qanday kelgan bo'lsa shundayligicha foydalanuvchiga yetkaz — u nusxalab ishlatadi.
 7. Suhbatdoshga xabar yuborish (send_business_message) — foydalanuvchi "X ga yozib yubor", "unga javob yubor", "xat yubor" desa DARHOL SHU funksiyani chaqir (Telegram Business orqali uning nomidan haqiqiy xabar ketadi). Foydalanuvchi aytgan nomni (masalan "developer") recipient sifatida to'g'ridan-to'g'ri ber — o'zingcha "bu kim ekan" deb mulohaza yuritma, funksiya o'zi topadi yoki ro'yxatni qaytaradi. QAT'IY: funksiya chaqirmasdan turib "yubordim" DEMA — bu yolg'on bo'ladi.
 6. Rasmlar — chek/kvitansiya rasmi kelsa, summa va do'konni aniqlab add_transaction chaqir.
 
@@ -1537,9 +1634,18 @@ def execute_function(user_id: int, name: str, args: dict) -> str:
         if name == "delete_reminder":
             return db_delete_reminder(user_id, int(args.get("reminder_id", 0)))
         if name == "add_note":
-            return db_add_note(user_id, args.get("text", ""))
+            if not (args.get("text") or args.get("code")):
+                return "Xato: saqlash uchun matn yoki kod bo'sh."
+            return db_add_note(
+                user_id, args.get("text", ""), args.get("title", ""),
+                args.get("tags", ""), args.get("code", ""), args.get("lang", ""),
+            )
         if name == "find_notes":
-            return db_find_notes(user_id, args.get("query", ""))
+            return db_find_notes(user_id, args.get("query", ""), args.get("tag", ""))
+        if name == "get_note":
+            return db_get_note(user_id, int(args.get("note_id", 0)))
+        if name == "list_tags":
+            return db_list_tags(user_id)
         if name == "delete_note":
             return db_delete_note(user_id, int(args.get("note_id", 0)))
         return f"Noma'lum funksiya: {name}"
@@ -2234,7 +2340,8 @@ async def agent_respond_project(message: Message, uid: int, text: str):
         chat_id=PROJECT_CHAT_ID,
         system_prompt=build_project_prompt(uid),
         tools_override=SAFE_BUSINESS_DECLARATIONS + [
-            d for d in FUNCTION_DECLARATIONS if d.name in ("remember", "add_note")
+            d for d in FUNCTION_DECLARATIONS
+            if d.name in ("remember", "add_note", "find_notes", "get_note", "list_tags")
         ],
     )
     if answer:
@@ -2858,8 +2965,17 @@ async def handle_text(message: Message, bot: Bot):
 
 
 async def send_long(message: Message, text: str):
+    """Uzun matnni bo'lib yuboradi. Kod bloki (```) bo'lsa Markdown bilan — Telegram'da
+    "nusxalash" tugmasi chiqadi; Markdown xato bersa oddiy matnga tushadi."""
     for i in range(0, len(text), 4000):
-        await message.answer(text[i:i + 4000])
+        chunk = text[i:i + 4000]
+        if "```" in chunk:
+            try:
+                await message.answer(chunk, parse_mode="Markdown")
+                continue
+            except Exception:
+                pass  # noto'g'ri Markdown — oddiy matn sifatida yuboramiz
+        await message.answer(chunk)
 
 
 # ============================================================
