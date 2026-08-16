@@ -698,7 +698,7 @@ def db_save_history_turn(user_id: int, role: str, text: str, chat_id: int = 0):
                        SELECT id FROM chat_history WHERE user_id = %s AND chat_id = %s
                        ORDER BY id DESC LIMIT %s
                    )""",
-                (user_id, chat_id, user_id, chat_id, MAX_HISTORY * 2),
+                (user_id, chat_id, user_id, chat_id, _history_limit(chat_id)),
             )
 
 
@@ -708,7 +708,7 @@ def db_load_history(user_id: int, chat_id: int = 0) -> list:
             cur.execute(
                 """SELECT role, text FROM chat_history
                    WHERE user_id = %s AND chat_id = %s ORDER BY id DESC LIMIT %s""",
-                (user_id, chat_id, MAX_HISTORY * 2),
+                (user_id, chat_id, _history_limit(chat_id)),
             )
             rows = cur.fetchall()
     return [
@@ -1553,6 +1553,11 @@ def execute_function(user_id: int, name: str, args: dict) -> str:
 # ============================================================
 
 MAX_HISTORY = 20
+MAX_HISTORY_PROJECT = 60  # loyiha rejimi: uzun strategik suhbat uchun
+
+
+def _history_limit(chat_id: int) -> int:
+    return (MAX_HISTORY_PROJECT if chat_id == 777 else MAX_HISTORY) * 2
 # Kalit: (user_id, chat_id). Telegram uchun chat_id doim 0, ilovada har suhbat alohida.
 chat_history: dict[tuple[int, int], list[types.Content]] = {}
 onboarding_state: dict[int, dict] = {}  # {user_id: {step, name, profession, interests, goals}}
@@ -1591,8 +1596,9 @@ def _save_history(user_id: int, user_parts: list[types.Part], answer: str, chat_
     saved = [p if p.text else types.Part.from_text(text="[media xabar]") for p in user_parts]
     history.append(types.Content(role="user", parts=saved))
     history.append(types.Content(role="model", parts=[types.Part.from_text(text=answer)]))
-    if len(history) > MAX_HISTORY * 2:
-        chat_history[key] = history[-MAX_HISTORY * 2:]
+    lim = _history_limit(chat_id)
+    if len(history) > lim:
+        chat_history[key] = history[-lim:]
     # Postgres'ga ham yozamiz — deploy/restartda kontekst yo'qolmasligi uchun
     try:
         user_text = " ".join(p.text for p in saved if p.text).strip() or "[media xabar]"
@@ -2109,6 +2115,132 @@ async def cmd_clear(message: Message):
     await message.answer("Suhbat tarixi tozalandi ✅")
 
 
+# ============================================================
+# LOYIHA MASLAHATCHISI — biznes g'oya → strategiya → UX → dizayn promptlari
+# ============================================================
+
+PROJECT_CHAT_ID = 777  # alohida kontekst: kundalik suhbat bilan aralashmaydi
+project_mode_users: set[int] = set()  # hozir loyiha rejimida bo'lganlar
+
+_PROJECT_STAGES = [
+    ("g'oya", "Biznes g'oya va qiymat taklifi"),
+    ("auditoriya", "Maqsadli auditoriya va muammolar"),
+    ("model", "Daromad modeli va bozor"),
+    ("raqobat", "Raqobat va noyob ustunlik"),
+    ("funksiya", "Asosiy funksiyalar (MVP)"),
+    ("ux", "Foydalanuvchi sayohati va onboarding"),
+    ("kpi", "Muvaffaqiyat ko'rsatkichlari va strategiya"),
+    ("hujjat", "Yakuniy hujjat + UI/UX dizayn promptlari"),
+]
+
+
+def build_project_prompt(user_id: int) -> str:
+    profile = db_get_profile(user_id)
+    name = (profile or {}).get("name") or "do'stim"
+    stages = "\n".join(f"  {i+1}. {t}" for i, (_, t) in enumerate(_PROJECT_STAGES))
+    return f"""Sen SIRDOSH — {name} uchun shaxsiy MAHSULOT STRATEGI, BIZNES-TAHLILCHI va UX-ARXITEKTORSAN.
+{name} — veb-dasturchi. U yangi raqamli platforma/veb-ilova g'oyasi bilan keldi. Sening vazifang —
+uni g'oyadan to dizaynerga beriladigan tayyor UI/UX promptlarigacha PROFESSIONAL darajada olib borish.
+
+ISHLASH USULI — bosqichma-bosqich, dialog tarzida:
+{stages}
+
+HAR BOSQICHDA:
+- 1-3 ta o'tkir, strategik savol ber (hammasini birdan emas!). Har savol NIMA UCHUN muhimligini bir jumlada ayt.
+- Javobni TAHLIL qil: kuchli tomonini ta'kidla, zaif joyini ochiq ayt, "bunday qilsak yaxshiroq" deb taklif ber.
+- Foydalanuvchi bilmasa — o'zing 2-3 ta professional variant taklif qil, u tanlasin.
+- Bosqich yetarli ochilganda: "✅ [Bosqich] tugadi. Xulosa: ..." deb 2-3 jumla yakunlab, keyingisiga o't.
+- Xabar boshida qaysi bosqichdaligingni ko'rsat, masalan: "📍 3/8 — Daromad modeli".
+
+SAVOL NAMUNALARI (moslab ishlat, so'zma-so'z emas):
+- Asosiy g'oya nima, qanday qiymat taklifi beradi? Foydalanuvchi qanday "og'riq"dan qutuladi?
+- Kim uchun? Ularning hozirgi yechimi nima va nega u yetarli emas?
+- Daromad: obuna / komissiya / reklama / sotuv / freemium — qaysi biri va nega?
+- Raqobatchilar kim, siz nimada 10x yaxshisiz? Noyob savdo taklifi (USP)?
+- KPI: qaysi 3 ta raqam muvaffaqiyatni ko'rsatadi (retention, LTV, konversiya...)?
+- MVP: eng muhim 3-5 funksiya? Nima 2-versiyaga qoladi?
+- Onboarding: birinchi 60 soniyada foydalanuvchi qanday "aha!" moment oladi?
+- 1 yillik strategiya: qayerga boradi, qanday o'sadi?
+
+YAKUNIY HUJJAT (8-bosqich) — quyidagi tuzilmada, to'liq va batafsil:
+1. Loyiha nomi va bir jumlalik pitch
+2. Muammo → Yechim → Qiymat taklifi
+3. Maqsadli auditoriya: 2-3 ta persona (ism, yosh, kasb, maqsad, og'riq)
+4. Biznes model va daromad manbalari
+5. Raqobat tahlili va USP
+6. MVP funksiyalar (ustuvorlik bilan) + keyingi versiyalar
+7. Foydalanuvchi sayohati (user journey) — asosiy oqim qadam-baqadam
+8. Axborot arxitekturasi — sahifalar/ekranlar daraxti
+9. KPI va 12 oylik strategiya
+10. UI/UX DIZAYN PROMPTLARI — har asosiy ekran uchun ALOHIDA, dizaynerga to'g'ridan-to'g'ri berish mumkin bo'lgan darajada:
+    - Ekran maqsadi va foydalanuvchi bu yerda nima qiladi
+    - Layout va tarkib ierarxiyasi
+    - Vizual uslub: rang palitrasi (hex bilan), tipografika, ikonografiya, bo'shliqlar
+    - Navigatsiya va foydalanuvchi oqimlari
+    - Interaktivlik: mikro-interaksiyalar, hover/tap holatlari, animatsiya tavsiyalari
+    - Bo'sh/yuklanish/xato holatlari
+    - Mobil va desktop farqlari
+    Promptlarni ingliz tilida ham ber (dizayn AI vositalari — Figma AI, Midjourney, v0, Lovable uchun).
+
+QOIDALAR:
+- Professional, lekin do'stona. Umumiy gaplar EMAS — aniq, amaliy, misollar bilan.
+- Zaif g'oyaga xushomad qilma — halol tahlil ber va kuchaytirish yo'lini ko'rsat.
+- Uzun matnlarni sarlavha va ro'yxatlar bilan tuzilmali yoz.
+- Foydalanuvchi "hujjatni yoz", "yakunla", "promptlarni ber" desa — mavjud ma'lumot bilan darhol yakuniy hujjatni yoz (yetishmagan joyni o'zing eng oqilona taxmin bilan to'ldirib, buni belgilab qo'y).
+- Foydalanuvchi "chiqish", "tugatdik" desa — qisqa xulosa ber va /loyiha_chiqish ni eslat.
+- Til: foydalanuvchi qaysi tilda yozsa — o'sha (asosan o'zbek).
+
+HOZIRGI VAQT: {now_local().strftime('%Y-%m-%d %H:%M')}."""
+
+
+@router.message(Command("loyiha"))
+async def cmd_project(message: Message):
+    uid = message.from_user.id
+    if not await asyncio.to_thread(db_is_approved, uid):
+        await message.answer("Botdan foydalanish uchun admin ruxsati kerak. /start bosing.")
+        return
+    project_mode_users.add(uid)
+    text = message.text.removeprefix("/loyiha").strip()
+    intro = (
+        "🚀 LOYIHA MASLAHATCHISI rejimi yoqildi\n\n"
+        "Endi men sizning mahsulot strategingiz va UX-arxitektoringizman. "
+        "G'oyangizni bosqichma-bosqich tahlil qilamiz:\n"
+        "g'oya → auditoriya → daromad → raqobat → MVP → UX → KPI → "
+        "yakuniy hujjat + dizayn promptlari.\n\n"
+        "Bu suhbat alohida saqlanadi — kundalik ishlaringizga aralashmaydi. "
+        "Istalgan payt qaytib davom ettirishingiz mumkin.\n"
+        "Chiqish: /loyiha_chiqish\n\n"
+    )
+    if text:
+        await message.answer(intro + "G'oyangizni o'qiyapman...")
+        await agent_respond_project(message, uid, text)
+    else:
+        await message.answer(intro + "Boshlaymiz — g'oyangizni erkin, o'z so'zlaringiz bilan yozib bering. Qanday platforma va kim uchun?")
+
+
+@router.message(Command("loyiha_chiqish"))
+async def cmd_project_exit(message: Message):
+    project_mode_users.discard(message.from_user.id)
+    await message.answer(
+        "Loyiha rejimidan chiqdik 👍 Oddiy suhbatga qaytdik.\n"
+        "Loyihaga qaytish uchun yana /loyiha yozing — hamma narsa eslab qolingan."
+    )
+
+
+async def agent_respond_project(message: Message, uid: int, text: str):
+    """Loyiha rejimida javob: alohida rol + alohida kontekst, javob har doim matnda."""
+    answer = await ask_agent(
+        uid, [types.Part.from_text(text=text)],
+        chat_id=PROJECT_CHAT_ID,
+        system_prompt=build_project_prompt(uid),
+        tools_override=SAFE_BUSINESS_DECLARATIONS + [
+            d for d in FUNCTION_DECLARATIONS if d.name in ("remember", "add_note")
+        ],
+    )
+    if answer:
+        await send_long(message, answer)
+
+
 def settings_keyboard(mode: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(
@@ -2524,7 +2656,10 @@ async def handle_voice(message: Message, bot: Bot):
             return
 
         # Keyin matn sifatida agentga yuboramiz
-        await agent_respond(message, message.from_user.id, [types.Part.from_text(text=text)])
+        if uid in project_mode_users:
+            await agent_respond_project(message, uid, text)
+        else:
+            await agent_respond(message, message.from_user.id, [types.Part.from_text(text=text)])
     except Exception:
         logger.exception("Golosli xabarda xato")
         await message.answer("Xatolik yuz berdi 😕 Qaytadan urinib ko'ring.")
@@ -2713,7 +2848,10 @@ async def handle_text(message: Message, bot: Bot):
     await asyncio.to_thread(db_track_user, uid, message.from_user.username, message.from_user.full_name)
     await bot.send_chat_action(message.chat.id, ChatAction.TYPING)
     try:
-        await agent_respond(message, message.from_user.id, [types.Part.from_text(text=message.text)])
+        if uid in project_mode_users:
+            await agent_respond_project(message, uid, message.text)
+        else:
+            await agent_respond(message, message.from_user.id, [types.Part.from_text(text=message.text)])
     except Exception:
         logger.exception("Matnli xabarda xato")
         await message.answer("Xatolik yuz berdi 😕 Qaytadan urinib ko'ring.")
@@ -2791,6 +2929,8 @@ async def main():
             BotCommand(command="start", description="Boshlash"),
             BotCommand(command="sozlamalar", description="⚙️ Javob turi: matn / ovoz"),
             BotCommand(command="biznes", description="💼 Avto-javob (Telegram Business)"),
+            BotCommand(command="loyiha", description="🚀 Loyiha maslahatchisi: g'oya → strategiya → UX"),
+            BotCommand(command="loyiha_chiqish", description="Loyiha rejimidan chiqish"),
             BotCommand(command="hisobot", description="Oylik moliyaviy hisobot"),
             BotCommand(command="eslatmalar", description="Faol eslatmalar"),
             BotCommand(command="clear", description="Suhbat tarixini tozalash"),
