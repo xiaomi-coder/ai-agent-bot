@@ -982,7 +982,29 @@ def extract_xlsx(data: bytes) -> str:
 # RASM YARATISH (Imagen)
 # ============================================================
 
+IMAGE_MODEL = os.getenv("IMAGE_MODEL", "gemini-2.5-flash-image")  # Nano Banana: yaratish + tahrirlash
+
+# Foydalanuvchining oxirgi yuklagan rasmi — "buni tahrirla" deganda ishlatiladi (15 daqiqa)
+last_user_image: dict[int, tuple] = {}  # uid -> (bytes, mime, timestamp)
+
+
 def do_generate_image(prompt: str) -> bytes | None:
+    """Matndan rasm yaratadi. Avval Gemini (Nano Banana), bo'lmasa Imagen."""
+    try:
+        resp = client.models.generate_content(
+            model=IMAGE_MODEL,
+            contents=[types.Part.from_text(text=prompt)],
+            config=types.GenerateContentConfig(response_modalities=["IMAGE", "TEXT"]),
+        )
+        cand = resp.candidates[0] if resp.candidates else None
+        parts = (cand.content.parts or []) if cand and cand.content else []
+        for part in parts:
+            if part.inline_data and part.inline_data.data:
+                return part.inline_data.data
+        logger.warning("Rasm yaratish: bo'sh (model=%s)", IMAGE_MODEL)
+    except Exception:
+        logger.exception("Rasm yaratishda (Gemini) xato — Imagen'ga o'tamiz")
+    # Zaxira: Imagen
     try:
         result = client.models.generate_images(
             model="imagen-3.0-generate-002",
@@ -992,8 +1014,66 @@ def do_generate_image(prompt: str) -> bytes | None:
         if result.generated_images:
             return result.generated_images[0].image.image_bytes
     except Exception:
-        logger.exception("Rasm yaratishda xato")
+        logger.exception("Rasm yaratishda (Imagen) xato")
     return None
+
+
+def do_edit_image(image_bytes: bytes, prompt: str, mime: str = "image/jpeg") -> tuple:
+    """Berilgan rasmni ko'rsatma bo'yicha tahrirlaydi. (rasm_bytes|None, izoh_matni) qaytaradi."""
+    full_prompt = (
+        "Edit this image exactly as instructed. Keep everything else unchanged, "
+        "preserve the subject's identity and photo realism. Instruction: " + prompt
+    )
+    for attempt in range(2):
+        try:
+            resp = client.models.generate_content(
+                model=IMAGE_MODEL,
+                contents=[
+                    types.Part.from_bytes(data=image_bytes, mime_type=mime),
+                    types.Part.from_text(text=full_prompt),
+                ],
+                config=types.GenerateContentConfig(response_modalities=["IMAGE", "TEXT"]),
+            )
+            cand = resp.candidates[0] if resp.candidates else None
+            parts = (cand.content.parts or []) if cand and cand.content else []
+            out_img, out_text = None, ""
+            for part in parts:
+                if part.inline_data and part.inline_data.data:
+                    out_img = part.inline_data.data
+                elif part.text:
+                    out_text += part.text
+            if out_img:
+                return out_img, out_text.strip()
+            logger.warning("Rasm tahrir: bo'sh javob (urinish %d)", attempt + 1)
+        except Exception:
+            logger.exception("Rasm tahrirlashda xato")
+        time.sleep(1)
+    return None, ""
+
+
+def _is_edit_instruction(text: str) -> bool:
+    """Matn rasmni TAHRIRLASH buyrug'imi? (savol/tahlil emas)"""
+    t = text.lower().translate(_CYR2LAT)
+    edit_kw = (
+        "o'zgartir", "ozgartir", "tahrir", "tahrirla", "edit", "qo'sh", "qosh",
+        "olib tashla", "o'chir", "ochir", "remove", "add", "fon", "background",
+        "orqa fon", "rang", "rangini", "color", "uslub", "style", "stil",
+        "chiroyli", "chiroyliroq", "yaxshila", "enhance", "sifat", "yorug'",
+        "qorong'i", "kattalashtir", "kichiklashtir", "kes", "crop", "ko'zoynak",
+        "soch", "kiyim", "ko'ylak", "kulgili", "anime", "rasm qilib", "surat qil",
+        "qora oq", "qora-oq", "eskirtir", "yoshartir", "qilib ber", "qilib yubor",
+    )
+    return any(k in t for k in edit_kw)
+
+
+def _is_analysis_question(text: str) -> bool:
+    """Matn rasmni TUSHUNTIRISH/O'QISH so'rovimi?"""
+    t = text.lower().translate(_CYR2LAT)
+    q_kw = (
+        "nima", "kim", "necha", "qancha", "o'qi", "oqi", "tahlil", "chek",
+        "matn", "yozilgan", "tarjima", "nima deb", "ayt", "tushuntir", "bu qanaqa",
+    )
+    return t.strip().endswith("?") or any(k in t for k in q_kw)
 
 
 # ============================================================
@@ -1553,7 +1633,7 @@ Imkoniyatlaring:
 1. Internet qidiruv (web_search) — yangi ma'lumot kerak bo'lsa taxmin qilma, qidir! O'zbekistonga oid odam/joy bo'lsa qidiruvga "O'zbekiston" qo'sh.
 2. Ob-havo (get_weather) — ob-havo so'ralsa SHU funksiyani ishlat, web_search EMAS. Joy aytilmasa, profildagi joyni yoki "Toshkent" ni ol.
    Kripto narxi (get_crypto) — Bitcoin/Ethereum kabi narxlar so'ralsa SHU funksiyani ishlat, web_search EMAS (real-time aniq narx).
-   Rasm yaratish (generate_image) — "rasm chiz", "surat yaratib ber" desa ishlatiladi. Prompt ni ingliz tilida, batafsil yoz.
+   Rasm yaratish (generate_image) — "rasm chiz", "surat yaratib ber" desa ishlatiladi. Prompt ni ingliz tilida, JUDA batafsil yoz (uslub, yorug'lik, kompozitsiya, kayfiyat, sifat). Rasm TAHRIRLASH (foydalanuvchi rasm yuklab "buni o'zgartir/fon/rang..." desa) — buni tizim avtomatik bajaradi, sen aralashma.
    Hujjat (PDF/Word/Excel) — foydalanuvchi fayl yuborsa avtomatik o'qiysan va tahlil qilasan.
 3. Buxgalteriya — xarajat/daromad aytilsa add_transaction. Hisobot so'ralsa get_report.
 4. Eslatmalar — set_reminder (vaqtni aniq 'YYYY-MM-DD HH:MM' ga aylantir).
@@ -2786,8 +2866,17 @@ async def handle_photo(message: Message, bot: Bot):
     try:
         photo = message.photo[-1]  # eng katta o'lcham
         img_data = await asyncio.to_thread(_fetch_telegram_file, photo.file_id)
+        caption = (message.caption or "").strip()
 
-        caption = message.caption or ""
+        # Rasmni eslab qolamiz — keyin "buni fonini o'chir" desa ishlatamiz (15 daqiqa)
+        last_user_image[uid] = (img_data, "image/jpeg", time.time())
+
+        # Izoh tahrir buyrug'imi (savol emas)? -> rasmni tahrirlaymiz
+        if caption and _is_edit_instruction(caption) and not _is_analysis_question(caption):
+            await edit_and_send(message, img_data, caption, "image/jpeg")
+            return
+
+        # Aks holda: tahlil qilamiz (chek/matn/tushuntirish)
         instruction = (
             "Bu rasmni tahlil qil. Agar chek/kvitansiya/to'lov rasmi bo'lsa — "
             "summani va do'kon/xizmat nomini aniqlab add_transaction funksiyasini chaqir, "
@@ -2795,15 +2884,37 @@ async def handle_photo(message: Message, bot: Bot):
         )
         if caption:
             instruction += f"\nFoydalanuvchi izohi: {caption}"
-
         parts = [
             types.Part.from_bytes(data=img_data, mime_type="image/jpeg"),
             types.Part.from_text(text=instruction),
         ]
         await agent_respond(message, message.from_user.id, parts)
+        if not caption:
+            await message.answer(
+                "💡 Bu rasmni tahrirlashni xohlasangiz — nima o'zgartirishni yozing.\n"
+                "Masalan: «fonini o'chir», «ko'ylakni qizil qil», «anime uslubida chiz», «sifatini yaxshila»."
+            )
     except Exception:
         logger.exception("Rasmda xato")
         await message.answer("Rasmni o'qishda xatolik 😕 Qaytadan urinib ko'ring.")
+
+
+async def edit_and_send(message: Message, img_bytes: bytes, prompt: str, mime: str):
+    """Rasmni tahrirlab, natijani yuboradi. Muvaffaqiyatsiz bo'lsa xabar beradi."""
+    await message.bot.send_chat_action(message.chat.id, ChatAction.UPLOAD_PHOTO)
+    out_img, out_text = await asyncio.to_thread(do_edit_image, img_bytes, prompt, mime)
+    if out_img:
+        # Tahrirlangan rasmni keyingi tahrir uchun ham eslab qolamiz (zanjir bo'lib tahrirlash)
+        last_user_image[message.from_user.id] = (out_img, "image/png", time.time())
+        await message.answer_photo(
+            BufferedInputFile(out_img, "tahrirlangan.png"),
+            caption=(out_text[:1000] if out_text else "Mana, tayyor ✅ Yana o'zgartirish kerak bo'lsa yozing."),
+        )
+    else:
+        await message.answer(
+            "Rasmni tahrirlab bo'lmadi 😕 Qaytadan, aniqroq yozib ko'ring "
+            "(masalan: «orqa fonni oq qil»)."
+        )
 
 
 @router.message(F.document)
@@ -2886,6 +2997,13 @@ async def handle_text(message: Message, bot: Bot):
         else:
             await asyncio.to_thread(db_set_business_field, uid, "business_hours", text[:100])
             await message.answer("⏰ Ish vaqti saqlandi!\nPanelga qaytish: /biznes")
+        return
+
+    # Yaqinda rasm yuklagan bo'lsa va "buni tahrirla" tarzida yozsa — o'sha rasmni tahrirlaymiz
+    img_entry = last_user_image.get(uid)
+    if img_entry and (time.time() - img_entry[2] < 900) and _is_edit_instruction(message.text) \
+            and uid not in onboarding_state:
+        await edit_and_send(message, img_entry[0], message.text.strip(), img_entry[1])
         return
 
     # Onboarding jarayoni
