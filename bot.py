@@ -988,6 +988,11 @@ IMAGE_MODEL = os.getenv("IMAGE_MODEL", "gemini-2.5-flash-image")  # Nano Banana:
 last_user_image: dict[int, tuple] = {}  # uid -> (bytes, mime, timestamp)
 
 
+def _is_quota_error(e: Exception) -> bool:
+    m = str(e).lower()
+    return "429" in m or "quota" in m or "resource_exhausted" in m or "exceeded" in m
+
+
 def do_generate_image(prompt: str) -> bytes | None:
     """Matndan rasm yaratadi. Avval Gemini (Nano Banana), bo'lmasa Imagen."""
     try:
@@ -1043,12 +1048,14 @@ def do_edit_image(image_bytes: bytes, prompt: str, mime: str = "image/jpeg") -> 
                 elif part.text:
                     out_text += part.text
             if out_img:
-                return out_img, out_text.strip()
+                return out_img, out_text.strip(), ""
             logger.warning("Rasm tahrir: bo'sh javob (urinish %d)", attempt + 1)
-        except Exception:
+        except Exception as e:
             logger.exception("Rasm tahrirlashda xato")
+            if _is_quota_error(e):
+                return None, "", "quota"
         time.sleep(1)
-    return None, ""
+    return None, "", ""
 
 
 def _is_edit_instruction(text: str) -> bool:
@@ -2902,13 +2909,18 @@ async def handle_photo(message: Message, bot: Bot):
 async def edit_and_send(message: Message, img_bytes: bytes, prompt: str, mime: str):
     """Rasmni tahrirlab, natijani yuboradi. Muvaffaqiyatsiz bo'lsa xabar beradi."""
     await message.bot.send_chat_action(message.chat.id, ChatAction.UPLOAD_PHOTO)
-    out_img, out_text = await asyncio.to_thread(do_edit_image, img_bytes, prompt, mime)
+    out_img, out_text, reason = await asyncio.to_thread(do_edit_image, img_bytes, prompt, mime)
     if out_img:
         # Tahrirlangan rasmni keyingi tahrir uchun ham eslab qolamiz (zanjir bo'lib tahrirlash)
         last_user_image[message.from_user.id] = (out_img, "image/png", time.time())
         await message.answer_photo(
             BufferedInputFile(out_img, "tahrirlangan.png"),
             caption=(out_text[:1000] if out_text else "Mana, tayyor ✅ Yana o'zgartirish kerak bo'lsa yozing."),
+        )
+    elif reason == "quota":
+        await message.answer(
+            "⚠️ Rasm tahrirlash limiti tugadi. Gemini'ning bepul tarifida rasm "
+            "generatsiyasi kunlik cheklangan — ertaga tiklanadi yoki API kalitida billing yoqilsa cheksiz ishlaydi."
         )
     else:
         await message.answer(
