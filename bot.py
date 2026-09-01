@@ -1748,7 +1748,7 @@ def _history_limit(chat_id: int) -> int:
 chat_history: dict[tuple[int, int], list[types.Content]] = {}
 onboarding_state: dict[int, dict] = {}  # {user_id: {step, name, profession, interests, goals}}
 
-FALLBACK_MODEL = os.getenv("GEMINI_FALLBACK_MODEL", "gemini-2.5-flash-lite")
+FALLBACK_MODEL = os.getenv("GEMINI_FALLBACK_MODEL", "gemini-3.5-flash-lite")
 
 
 def gemini_generate(model: str, contents, config=None):
