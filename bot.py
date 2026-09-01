@@ -982,7 +982,7 @@ def extract_xlsx(data: bytes) -> str:
 # RASM YARATISH (Imagen)
 # ============================================================
 
-IMAGE_MODEL = os.getenv("IMAGE_MODEL", "gemini-2.5-flash-image")  # Nano Banana: yaratish + tahrirlash
+IMAGE_MODEL = os.getenv("IMAGE_MODEL", "gemini-3.1-flash-image")  # Nano Banana: yaratish + tahrirlash
 
 # Foydalanuvchining oxirgi yuklagan rasmi — "buni tahrirla" deganda ishlatiladi (15 daqiqa)
 last_user_image: dict[int, tuple] = {}  # uid -> (bytes, mime, timestamp)
@@ -1026,8 +1026,17 @@ def do_generate_image(prompt: str) -> bytes | None:
 def do_edit_image(image_bytes: bytes, prompt: str, mime: str = "image/jpeg") -> tuple:
     """Berilgan rasmni ko'rsatma bo'yicha tahrirlaydi. (rasm_bytes|None, izoh_matni) qaytaradi."""
     full_prompt = (
-        "Edit this image exactly as instructed. Keep everything else unchanged, "
-        "preserve the subject's identity and photo realism. Instruction: " + prompt
+        "You are a precise photo editor. Apply ONLY the change described below to the "
+        "provided image. This is a targeted local edit, NOT a regeneration.\n"
+        "STRICT RULES:\n"
+        "- Change ONLY what is explicitly requested. Do not touch anything else.\n"
+        "- Keep the SAME people and faces (identity, features), same pose, same expression, "
+        "same clothing (unless the change is about them), same background, same colors, "
+        "same lighting, same camera angle, same composition and framing.\n"
+        "- Match the original resolution, style and photorealism. The result must look like "
+        "the same photo with only the requested edit, not a new image.\n"
+        "- Do not add text, watermarks, borders or extra objects.\n"
+        "REQUESTED CHANGE: " + prompt
     )
     for attempt in range(2):
         try:
@@ -1069,6 +1078,8 @@ def _is_edit_instruction(text: str) -> bool:
         "qorong'i", "kattalashtir", "kichiklashtir", "kes", "crop", "ko'zoynak",
         "soch", "kiyim", "ko'ylak", "kulgili", "anime", "rasm qilib", "surat qil",
         "qora oq", "qora-oq", "eskirtir", "yoshartir", "qilib ber", "qilib yubor",
+        "ko'k", "kok", "qizil", "yashil", "sariq", "oq qil", "qora qil", "kul rang",
+        "chap", "o'ng", "yuqori", "past", "kattaroq", "kichikroq", "yorqin", "xira",
     )
     return any(k in t for k in edit_kw)
 
@@ -1081,6 +1092,13 @@ def _is_analysis_question(text: str) -> bool:
         "matn", "yozilgan", "tarjima", "nima deb", "ayt", "tushuntir", "bu qanaqa",
     )
     return t.strip().endswith("?") or any(k in t for k in q_kw)
+
+
+def _mentions_image(text: str) -> bool:
+    t = text.lower().translate(_CYR2LAT)
+    kw = ("rasm", "surat", "foto", "photo", "image", "logo", "dizayn", "banner",
+          "shunday qil", "shunga o'xshash", "shunga oxshash", "buni", "bunga")
+    return any(k in t for k in kw)
 
 
 # ============================================================
@@ -3011,10 +3029,12 @@ async def handle_text(message: Message, bot: Bot):
             await message.answer("⏰ Ish vaqti saqlandi!\nPanelga qaytish: /biznes")
         return
 
-    # Yaqinda rasm yuklagan bo'lsa va "buni tahrirla" tarzida yozsa — o'sha rasmni tahrirlaymiz
+    # Yaqinda rasm yuklagan bo'lsa: tahrir buyrug'i YOKI "rasm/surat/shunday qil" desa —
+    # o'sha namuna rasmni ishlatib tahrirlaymiz (savol bo'lmasa). Namunani e'tiborsiz qoldirmaslik uchun.
     img_entry = last_user_image.get(uid)
-    if img_entry and (time.time() - img_entry[2] < 900) and _is_edit_instruction(message.text) \
-            and uid not in onboarding_state:
+    if img_entry and (time.time() - img_entry[2] < 900) and uid not in onboarding_state \
+            and not _is_analysis_question(message.text) \
+            and (_is_edit_instruction(message.text) or _mentions_image(message.text)):
         await edit_and_send(message, img_entry[0], message.text.strip(), img_entry[1])
         return
 
