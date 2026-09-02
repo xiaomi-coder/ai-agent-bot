@@ -1877,7 +1877,7 @@ MAX_HISTORY_PROJECT = 60  # loyiha rejimi: uzun strategik suhbat uchun
 
 
 def _history_limit(chat_id: int) -> int:
-    return (MAX_HISTORY_PROJECT if chat_id == 777 else MAX_HISTORY) * 2
+    return (MAX_HISTORY_PROJECT if chat_id in (777, 778, 779) else MAX_HISTORY) * 2
 # Kalit: (user_id, chat_id). Telegram uchun chat_id doim 0, ilovada har suhbat alohida.
 chat_history: dict[tuple[int, int], list[types.Content]] = {}
 onboarding_state: dict[int, dict] = {}  # {user_id: {step, name, profession, interests, goals}}
@@ -2671,6 +2671,123 @@ async def agent_respond_code(message: Message, uid: int, text: str):
 
 
 # ============================================================
+# /DIZAYN — UI/UX dizayn brief + Claude Design / v0 / Lovable uchun kuchli prompt
+# ============================================================
+
+DESIGN_CHAT_ID = 779
+design_mode_users: set[int] = set()
+
+_DESIGN_STRONG = ("claude design", "design prompt", "dizayn prompt", "ui prompt", "ux prompt",
+                  "dizayn uchun prompt", "landing uchun prompt", "sayt uchun prompt")
+_DESIGN_WORDS_RE = re.compile(
+    r"\b(landing|lending|sayt|website|web-?site|ui|ux|dizayn|design|figma|lovable|v0|framer|"
+    r"ekran|screen|mockup|maket|interfeys|interface|banner|logo)\b"
+)
+
+
+def _looks_like_design_request(text: str) -> bool:
+    """"Claude Design uchun prompt ber", "landing page prompt" kabi so'rovlarni taniydi."""
+    t = text.lower().translate(_CYR2LAT)
+    if any(k in t for k in _DESIGN_STRONG):
+        return True
+    return "prompt" in t and bool(_DESIGN_WORDS_RE.search(t))
+
+
+def build_design_prompt(user_id: int) -> str:
+    profile = db_get_profile(user_id)
+    name = (profile or {}).get("name") or "do'stim"
+    return f"""Sen SIRDOSH — {name} uchun SENIOR PRODUCT DESIGNER, UX-STRATEG va PROMPT-MUHANDISSAN.
+{name} — veb-dasturchi. U sendan landing page, sayt, ilova ekrani yoki UI komponenti uchun
+Claude Design / v0 / Lovable / Figma AI ga beriladigan PROMPT so'raydi. Sening vazifang — shunchaki
+prompt emas, DIZAYN STRATEGIYASI + shu vositalar eng zo'r natija beradigan darajada ANIQ prompt berish.
+
+ISHLASH TARTIBI:
+1) TEZKOR TAHLIL (3-6 qator): mahsulot nima, kim uchun, sahifaning BITTA asosiy maqsadi (signup /
+   sotuv / lead / yuklab olish), foydalanuvchining og'rig'i, kutilgan his-tuyg'u (ishonch / hayajon / premium).
+2) MA'LUMOT YETISHMASA: eng ko'pi bilan 3 ta o'tkir savol ber — FAQAT BIR MARTA. Foydalanuvchi
+   "shunchaki qil" desa yoki umumiy ma'lumot bersa — oqilona taxminlar bilan DARHOL to'liq natija ber,
+   taxminlarni "(taxmin)" deb belgila. Savol-javobga cho'zilma.
+3) 🎯 DIZAYN BRIEF (o'zbekcha, qisqa): uslub yo'nalishi va NEGA aynan shu; bo'limlar ro'yxati va har
+   birining vazifasi; asosiy xabar (value proposition) va CTA matni.
+4) 📋 PROMPT — asosiy mahsulot. BITTA to'liq, nusxalab tashlashga tayyor INGLIZCHA prompt, ```text
+   bloki ichida. Umumiy gaplar TAQIQLANADI — hamma narsa aniq va konkret. Tarkibi:
+   - ROLE & CONTEXT: kim uchun, mahsulot bir jumlada, auditoriya, asosiy maqsad va primary CTA
+   - VISUAL DIRECTION: uslub nomi (masalan "clean SaaS minimal", "bold editorial", "glass dark"),
+     RANG PALITRASI hex bilan (primary, secondary, accent, background, surface, text, muted),
+     TIPOGRAFIKA (font juftligi, sarlavha/matn o'lchamlar shkalasi, og'irliklar), spacing/grid,
+     radius, soyalar, rasm/illustratsiya uslubi, ikonografiya
+   - PAGE STRUCTURE — bo'limma-bo'lim, HAR BIRIDA HAQIQIY MATN (foydalanuvchi tilida, lorem ipsum emas):
+     Nav → Hero (headline, subheadline, CTA'lar, vizual) → Social proof → Features (3-6: ikon+sarlavha+
+     tavsif) → How it works → Pricing (kerak bo'lsa) → Testimonials → FAQ → Final CTA → Footer.
+     (Ilova ekrani bo'lsa — ekran tuzilmasi, komponentlar, holatlar.)
+   - COMPONENTS & STATES: tugmalar (primary/secondary/ghost, hover/active/disabled), kartalar,
+     formalar (validatsiya, xato holati), bo'sh/yuklanish holatlari
+   - INTERACTIONS & MOTION: scroll-reveal, hover mikro-interaksiyalar, hero animatsiyasi —
+     nozik, davomiylik (ms) va easing bilan; haddan tashqari emas
+   - RESPONSIVE: mobile-first, breakpoint'lar, nima qanday yig'iladi; touch target'lar
+   - ACCESSIBILITY: kontrast (WCAG AA), focus holatlari, alt matn, klaviatura
+   - QUALITY BAR: "production-ready, pixel-consistent spacing, no placeholder text, no generic
+     stock look, consistent design tokens"
+   - Agar foydalanuvchi stack aytsa (React/Tailwind/Next) — texnik cheklovlar
+5) 💡 MASLAHAT (2-3 qator): natijani yanada kuchaytirish uchun nimani o'zgartirish, 1 ta muqobil uslub,
+   A/B g'oya.
+
+QOIDALAR:
+- Ranglar HAR DOIM hex bilan, fontlar nomi bilan, o'lchamlar raqam bilan. "Chiroyli", "zamonaviy"
+  kabi bo'sh so'zlar emas — aniq ko'rsatma.
+- Matnlar (headline, CTA, feature tavsiflari) HAQIQIY va sotadigan bo'lsin — copywriting darajasida.
+- Foydalanuvchi havola/namuna sayt bersa — fetch_url bilan o'qib, uslubini tahlil qil va promptga singdir.
+- Uslubni mahsulotga moslab tanla: fintech → ishonch/aniqlik, ta'lim → do'stona/ochiq, premium →
+  ko'p bo'shliq/serif, dev-tool → dark/mono aksent.
+- Prompt ingliz tilida (vositalar shuni yaxshi tushunadi), qolgan izohlar foydalanuvchi tilida.
+- Prompt uzun bo'lishi mumkin (1500-3000 so'z normal) — sifat uzunlikdan muhim, lekin hech narsa tushib qolmasin.
+
+HOZIRGI VAQT: {now_local().strftime('%Y-%m-%d %H:%M')}."""
+
+
+@router.message(Command("dizayn"))
+async def cmd_design(message: Message):
+    uid = message.from_user.id
+    if not await asyncio.to_thread(db_is_approved, uid):
+        await message.answer("Botdan foydalanish uchun admin ruxsati kerak. /start bosing.")
+        return
+    design_mode_users.add(uid)
+    text = message.text.removeprefix("/dizayn").strip()
+    intro = (
+        "🎨 DIZAYN REJIMI yoqildi — men sizning senior product designer'ingizman.\n\n"
+        "Nima yasamoqchisiz (landing, sayt, ilova ekrani, komponent) va kim uchun — yozing. "
+        "Men: tahlil → dizayn brief → Claude Design / v0 / Lovable'ga tayyor kuchli prompt beraman.\n"
+        "Namuna sayt havolasi bo'lsa — tashlang, uslubini o'rganaman.\n\n"
+        "Eslatma: oddiy suhbatda «Claude Design uchun prompt ber» desangiz ham o'zim tushunaman.\n"
+        "Chiqish: /dizayn_chiqish\n\n"
+    )
+    if text:
+        await message.answer(intro + "Tahlil qilyapman...")
+        await agent_respond_design(message, uid, text)
+    else:
+        await message.answer(intro + "Loyihangizni tasvirlab bering.")
+
+
+@router.message(Command("dizayn_chiqish"))
+async def cmd_design_exit(message: Message):
+    design_mode_users.discard(message.from_user.id)
+    await message.answer("Dizayn rejimidan chiqdik 👍 Qaytish: /dizayn")
+
+
+async def agent_respond_design(message: Message, uid: int, text: str):
+    answer = await ask_agent(
+        uid, [types.Part.from_text(text=text)],
+        chat_id=DESIGN_CHAT_ID,
+        system_prompt=build_design_prompt(uid),
+        tools_override=SAFE_BUSINESS_DECLARATIONS + [
+            d for d in FUNCTION_DECLARATIONS if d.name in ("add_note", "find_notes", "get_note")
+        ],
+    )
+    if answer:
+        await send_long(message, answer)
+
+
+# ============================================================
 # /SHABLON — rasm shablonlarini boshqarish
 # ============================================================
 
@@ -3139,6 +3256,8 @@ async def handle_voice(message: Message, bot: Bot):
         # Keyin matn sifatida agentga yuboramiz
         if uid in project_mode_users:
             await agent_respond_project(message, uid, text)
+        elif uid in design_mode_users:
+            await agent_respond_design(message, uid, text)
         elif uid in code_mode_users:
             await agent_respond_code(message, uid, text)
         else:
@@ -3433,6 +3552,9 @@ async def handle_text(message: Message, bot: Bot):
     try:
         if uid in project_mode_users:
             await agent_respond_project(message, uid, message.text)
+        elif uid in design_mode_users or _looks_like_design_request(message.text):
+            # /dizayn rejimi yoki "Claude Design uchun prompt ber" kabi so'rov
+            await agent_respond_design(message, uid, message.text)
         elif uid in code_mode_users or _looks_like_error(message.text):
             # /kod rejimi yoki xabar traceback/xatoga o'xshasa — senior dasturchi sifatida tahlil
             await agent_respond_code(message, uid, message.text)
@@ -3582,6 +3704,8 @@ async def main():
             BotCommand(command="loyiha_chiqish", description="Loyiha rejimidan chiqish"),
             BotCommand(command="kod", description="👨‍💻 Kod review / xato tahlili"),
             BotCommand(command="kod_chiqish", description="Kod rejimidan chiqish"),
+            BotCommand(command="dizayn", description="🎨 UI/UX brief + Claude Design prompt"),
+            BotCommand(command="dizayn_chiqish", description="Dizayn rejimidan chiqish"),
             BotCommand(command="shablon", description="🗂 Rasm shablonlarim"),
             BotCommand(command="hisobot", description="Oylik moliyaviy hisobot"),
             BotCommand(command="eslatmalar", description="Faol eslatmalar"),
