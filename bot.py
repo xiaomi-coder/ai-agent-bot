@@ -19,6 +19,7 @@ import io
 import logging
 import os
 import time
+import re
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -148,6 +149,18 @@ def db_init():
                     sender TEXT,
                     text TEXT,
                     created_at TIMESTAMP NOT NULL DEFAULT NOW()
+                )
+            """)
+            # Rasm shablonlari — foydalanuvchi bir marta saqlaydi, doim ishlatadi
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS image_templates (
+                    id SERIAL PRIMARY KEY,
+                    user_id BIGINT NOT NULL,
+                    name TEXT NOT NULL,
+                    image BYTEA NOT NULL,
+                    mime TEXT NOT NULL DEFAULT 'image/jpeg',
+                    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                    UNIQUE (user_id, name)
                 )
             """)
             cur.execute("""
@@ -601,6 +614,48 @@ def db_business_log_cleanup():
             cur.execute("DELETE FROM business_log WHERE created_at < NOW() - INTERVAL '30 days'")
 
 
+# --- Rasm shablonlari ---
+
+def db_save_template(user_id: int, name: str, image: bytes, mime: str) -> str:
+    name = name.strip().lower()[:60] or "asosiy"
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO image_templates (user_id, name, image, mime) VALUES (%s, %s, %s, %s)
+                ON CONFLICT (user_id, name) DO UPDATE
+                SET image = EXCLUDED.image, mime = EXCLUDED.mime, created_at = NOW()
+            """, (user_id, name, psycopg2.Binary(image), mime))
+    return name
+
+
+def db_get_template(user_id: int, name: str) -> dict | None:
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT name, image, mime FROM image_templates WHERE user_id = %s AND name ILIKE %s "
+                "ORDER BY (name = %s) DESC LIMIT 1",
+                (user_id, f"%{name.strip().lower()}%", name.strip().lower()),
+            )
+            r = cur.fetchone()
+    if not r:
+        return None
+    return {"name": r["name"], "image": bytes(r["image"]), "mime": r["mime"]}
+
+
+def db_list_templates(user_id: int) -> list[str]:
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT name FROM image_templates WHERE user_id = %s ORDER BY created_at DESC", (user_id,))
+            return [r["name"] for r in cur.fetchall()]
+
+
+def db_delete_template(user_id: int, name: str) -> bool:
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM image_templates WHERE user_id = %s AND name = %s", (user_id, name.strip().lower()))
+            return cur.rowcount > 0
+
+
 def db_admin_stats() -> str:
     with get_conn() as conn:
         with conn.cursor() as cur:
@@ -983,6 +1038,7 @@ def extract_xlsx(data: bytes) -> str:
 # ============================================================
 
 IMAGE_MODEL = os.getenv("IMAGE_MODEL", "gemini-3.1-flash-image")  # Nano Banana: yaratish + tahrirlash
+IMAGE_MODEL_PRO = os.getenv("IMAGE_MODEL_PRO", "gemini-3-pro-image")  # professional sifat (shablon/"professional")
 
 # Foydalanuvchining oxirgi yuklagan rasmi — "buni tahrirla" deganda ishlatiladi (15 daqiqa)
 last_user_image: dict[int, tuple] = {}  # uid -> (bytes, mime, timestamp)
@@ -1023,29 +1079,51 @@ def do_generate_image(prompt: str) -> bytes | None:
     return None
 
 
-def do_edit_image(image_bytes: bytes, prompt: str, mime: str = "image/jpeg") -> tuple:
-    """Berilgan rasmni ko'rsatma bo'yicha tahrirlaydi. (rasm_bytes|None, izoh_matni) qaytaradi."""
-    full_prompt = (
-        "You are a precise photo editor. Apply ONLY the change described below to the "
-        "provided image. This is a targeted local edit, NOT a regeneration.\n"
-        "STRICT RULES:\n"
-        "- Change ONLY what is explicitly requested. Do not touch anything else.\n"
-        "- Keep the SAME people and faces (identity, features), same pose, same expression, "
-        "same clothing (unless the change is about them), same background, same colors, "
-        "same lighting, same camera angle, same composition and framing.\n"
-        "- Match the original resolution, style and photorealism. The result must look like "
-        "the same photo with only the requested edit, not a new image.\n"
-        "- Do not add text, watermarks, borders or extra objects.\n"
-        "REQUESTED CHANGE: " + prompt
-    )
+def do_edit_image(
+    image_bytes: bytes, prompt: str, mime: str = "image/jpeg",
+    extra_images: list | None = None, model: str | None = None,
+) -> tuple:
+    """Berilgan rasmni ko'rsatma bo'yicha tahrirlaydi. (rasm_bytes|None, izoh_matni, sabab) qaytaradi.
+    extra_images: [(bytes, mime), ...] — shablon ustiga joylashtiriladigan qo'shimcha rasmlar.
+    model: None bo'lsa IMAGE_MODEL; professional uchun IMAGE_MODEL_PRO."""
+    if extra_images:
+        full_prompt = (
+            "You are a professional graphic designer and photo compositor. The FIRST image is the "
+            "TEMPLATE/BASE — keep its layout, design, colors, typography and every element exactly as is. "
+            "The following image(s) are ELEMENTS to place onto the template exactly as instructed "
+            "(position, size, blending must look natural and professional, matching lighting and perspective). "
+            "Do not redesign the template. Do not invent extra text or objects. Output at the template's "
+            "resolution with print-quality sharpness.\n"
+            "SAFETY: If the template is an identity document, ID card, passport, driver's license or any "
+            "official credential, DO NOT modify it — instead return the template unchanged.\n"
+            "INSTRUCTION: " + prompt
+        )
+    else:
+        full_prompt = (
+            "You are a precise photo editor. Apply ONLY the change described below to the "
+            "provided image. This is a targeted local edit, NOT a regeneration.\n"
+            "STRICT RULES:\n"
+            "- Change ONLY what is explicitly requested. Do not touch anything else.\n"
+            "- Keep the SAME people and faces (identity, features), same pose, same expression, "
+            "same clothing (unless the change is about them), same background, same colors, "
+            "same lighting, same camera angle, same composition and framing.\n"
+            "- Match the original resolution, style and photorealism. The result must look like "
+            "the same photo with only the requested edit, not a new image.\n"
+            "- Do not add text, watermarks, borders or extra objects.\n"
+            "- SAFETY: if the image is an identity document (ID card, passport, license, official "
+            "credential), do NOT alter faces, names, numbers or dates — return it unchanged.\n"
+            "REQUESTED CHANGE: " + prompt
+        )
+    use_model = model or IMAGE_MODEL
+    contents = [types.Part.from_bytes(data=image_bytes, mime_type=mime)]
+    for eb, em in (extra_images or []):
+        contents.append(types.Part.from_bytes(data=eb, mime_type=em))
+    contents.append(types.Part.from_text(text=full_prompt))
     for attempt in range(2):
         try:
             resp = client.models.generate_content(
-                model=IMAGE_MODEL,
-                contents=[
-                    types.Part.from_bytes(data=image_bytes, mime_type=mime),
-                    types.Part.from_text(text=full_prompt),
-                ],
+                model=use_model,
+                contents=contents,
                 config=types.GenerateContentConfig(response_modalities=["IMAGE", "TEXT"]),
             )
             cand = resp.candidates[0] if resp.candidates else None
@@ -1099,6 +1177,36 @@ def _mentions_image(text: str) -> bool:
     kw = ("rasm", "surat", "foto", "photo", "image", "logo", "dizayn", "banner",
           "shunday qil", "shunga o'xshash", "shunga oxshash", "buni", "bunga")
     return any(k in t for k in kw)
+
+
+def _wants_pro(text: str) -> bool:
+    """"Professional", "sifatli", "pro" desa — kuchli (qimmatroq) rasm modeli."""
+    t = text.lower().translate(_CYR2LAT)
+    return any(k in t for k in ("professional", "profesional", "sifatli", "yuqori sifat", " pro ", "mukammal"))
+
+
+_TEMPLATE_SAVE_RE = re.compile(r"^\s*(?:shablon|template)\s*[:\-]?\s*(?:sifatida\s+saqla\s*|saqla\s*)?(.*)$", re.I)
+
+
+def _parse_template_save(caption: str) -> str | None:
+    """Caption 'shablon: banner' / 'shablon banner' / 'shablon sifatida saqla banner' -> 'banner'."""
+    c = caption.strip().translate(_CYR2LAT)
+    m = _TEMPLATE_SAVE_RE.match(c)
+    if not m:
+        return None
+    name = m.group(1).strip().strip(":").strip()
+    return (name or "asosiy").lower()
+
+
+def _find_template_ref(text: str, names: list[str]) -> str | None:
+    """Matnda 'shablon' + saqlangan nom bo'lsa — nomni qaytaradi; bitta shablon bo'lsa uni."""
+    t = text.lower().translate(_CYR2LAT)
+    if "shablon" not in t and "template" not in t:
+        return None
+    for n in names:
+        if n and n in t:
+            return n
+    return names[0] if len(names) == 1 else None
 
 
 # ============================================================
@@ -2438,6 +2546,152 @@ async def cmd_project_exit(message: Message):
     )
 
 
+# ============================================================
+# /KOD — SENIOR DASTURCHI: kod review + xato (traceback) tahlili
+# ============================================================
+
+CODE_CHAT_ID = 778  # alohida kontekst
+code_mode_users: set[int] = set()
+
+_CODE_EXTS = (
+    ".py", ".js", ".ts", ".tsx", ".jsx", ".kt", ".kts", ".java", ".go", ".rs", ".php", ".rb",
+    ".html", ".css", ".scss", ".sql", ".sh", ".bash", ".zsh", ".yaml", ".yml", ".toml", ".xml",
+    ".gradle", ".dart", ".swift", ".c", ".cpp", ".h", ".hpp", ".cs", ".vue", ".svelte", ".env.example",
+    ".dockerfile", ".ini", ".cfg", ".log",
+)
+
+_ERROR_MARKERS = (
+    "traceback (most recent", "exception", "error:", "errno", "at line", ", line ", "stack trace",
+    "stacktrace", "clienterror", "typeerror", "nameerror", "valueerror", "keyerror", "attributeerror",
+    "syntaxerror", "indexerror", "importerror", "modulenotfound", "nullpointer", "undefined is not",
+    "cannot read prop", "npm err", "build failed", "exit code", "fatal:", "panic:", "segmentation fault",
+    "status_code", "http 500", "http 400", "http 404", "500 internal", "invalid_argument", "unhandled",
+    "failed to", "error 4", "error 5", "e/androidruntime", "gradle", "compilation failed",
+)
+
+
+def _looks_like_error(text: str) -> bool:
+    """Xabar traceback/log/xato matniga o'xshaydimi? (o'zbekcha 'xato' so'zi hisobga olinmaydi)"""
+    if len(text) < 25:
+        return False
+    t = text.lower()
+    return any(m in t for m in _ERROR_MARKERS)
+
+
+def build_code_prompt(user_id: int) -> str:
+    profile = db_get_profile(user_id)
+    name = (profile or {}).get("name") or "do'stim"
+    return f"""Sen SIRDOSH — {name} uchun SENIOR SOFTWARE ENGINEER va TECH LEAD'san.
+{name} — veb/mobil dasturchi (Python/aiogram, Kotlin/Android, JS, Flutter). Sen unga kod bo'yicha
+aniq, amaliy, professional yordam berasan. Umumiy gaplar YO'Q — faqat konkret.
+
+AGAR XATO / TRACEBACK / LOG YUBORILSA — shu tuzilmada javob ber:
+🔴 SABAB — bir-ikki jumlada aniq nima bo'lgani (ildiz sabab, simptom emas)
+📍 QAYERDA — fayl/qator/funksiya (tracebackdan aniq ko'rsat)
+✅ TUZATISH — tayyor kod (```til bloki bilan), nusxalab qo'ysa ishlaydigan
+🛡 OLDINI OLISH — 1-2 ta qisqa maslahat (keyin qaytmasligi uchun)
+
+AGAR KOD YUBORILSA (review) — shu tuzilmada:
+🐛 XATOLAR — mantiqiy/runtime xatolar, chekka holatlar (bo'lsa)
+🔒 XAVFSIZLIK — injection, secret leak, auth, input validation (bo'lsa)
+⚡ SAMARADORLIK — keraksiz so'rovlar, N+1, bloklovchi chaqiruvlar (bo'lsa)
+✨ REFAKTOR — eng muhim 1-3 ta yaxshilash, TAYYOR KOD bilan
+Muammo bo'lmasa — "ko'rinadigan muammo yo'q" deb ochiq ayt, to'qima.
+
+AGAR SAVOL BO'LSA — qisqa tushuntirish + ishlaydigan kod misoli.
+
+QOIDALAR:
+- Kodni HAR DOIM ``` bloklarida, til nomi bilan ber (```python, ```kotlin ...).
+- Yuborilgan kodning uslubi/kutubxonalariga mos yoz, boshqa stackga o'tkazma.
+- Aniq bilmasang — taxminni "ehtimol" deb belgila, kerak bo'lsa aniqlashtiruvchi 1 savol ber.
+- Uzun bo'lma: muhimini birinchi, tafsilotni keyin. Ortiqcha kirish/xulosa gaplar yozma.
+- Foydalanuvchi saqlangan snippetlarini so'rasa find_notes/get_note ishlat; "buni saqla" desa add_note.
+- Til: foydalanuvchi qaysi tilda yozsa (asosan o'zbek); texnik atamalar inglizcha qolaveradi.
+
+HOZIRGI VAQT: {now_local().strftime('%Y-%m-%d %H:%M')}."""
+
+
+@router.message(Command("kod"))
+async def cmd_code(message: Message):
+    uid = message.from_user.id
+    if not await asyncio.to_thread(db_is_approved, uid):
+        await message.answer("Botdan foydalanish uchun admin ruxsati kerak. /start bosing.")
+        return
+    code_mode_users.add(uid)
+    text = message.text.removeprefix("/kod").strip()
+    intro = (
+        "👨‍💻 KOD REJIMI yoqildi — men sizning senior dasturchi hamkoringizman.\n\n"
+        "• Kod yuboring (matn yoki .py/.kt/.js fayl) → xatolar, xavfsizlik, optimallashtirish, refaktor\n"
+        "• Traceback/log tashlang → sabab, qayerda, tayyor tuzatish\n"
+        "• Savol bering → tushuntirish + ishlaydigan misol\n\n"
+        "Eslatma: traceback'ni oddiy suhbatda tashlasangiz ham o'zim tanib tahlil qilaman.\n"
+        "Chiqish: /kod_chiqish\n\n"
+    )
+    if text:
+        await message.answer(intro + "Ko'rib chiqyapman...")
+        await agent_respond_code(message, uid, text)
+    else:
+        await message.answer(intro + "Kod, xato yoki savolingizni yuboring.")
+
+
+@router.message(Command("kod_chiqish"))
+async def cmd_code_exit(message: Message):
+    code_mode_users.discard(message.from_user.id)
+    await message.answer("Kod rejimidan chiqdik 👍 Oddiy suhbatga qaytdik. Qaytish: /kod")
+
+
+async def agent_respond_code(message: Message, uid: int, text: str):
+    """Kod rejimi: alohida rol + alohida kontekst, javob matnda (kod bloklari bilan)."""
+    answer = await ask_agent(
+        uid, [types.Part.from_text(text=text)],
+        chat_id=CODE_CHAT_ID,
+        system_prompt=build_code_prompt(uid),
+        tools_override=SAFE_BUSINESS_DECLARATIONS + [
+            d for d in FUNCTION_DECLARATIONS
+            if d.name in ("add_note", "find_notes", "get_note", "list_tags")
+        ],
+    )
+    if answer:
+        await send_long(message, answer)
+
+
+# ============================================================
+# /SHABLON — rasm shablonlarini boshqarish
+# ============================================================
+
+@router.message(Command("shablon"))
+async def cmd_template(message: Message):
+    uid = message.from_user.id
+    names = await asyncio.to_thread(db_list_templates, uid)
+    if names:
+        lst = "\n".join(f"• «{n}»" for n in names)
+        await message.answer(
+            f"🗂 Saqlangan shablonlar:\n{lst}\n\n"
+            "Ishlatish:\n"
+            "• Rasm yuborib izohga: «banner shabloniga joylashtir, o'ng tomonga»\n"
+            "• Yoki matnda: «banner shablonini ko'k rangga o'zgartir»\n"
+            "Yangi shablon: rasm yuborib izohga «shablon: nom»\n"
+            "O'chirish: /shablon_ochir nom"
+        )
+    else:
+        await message.answer(
+            "🗂 Hali shablon yo'q.\n\n"
+            "Saqlash: rasm (dizayn/banner/karta) yuboring va izohga «shablon: nom» deb yozing.\n"
+            "Keyin istalgan payt «nom shabloni bilan ...» deb ishlatasiz — u doim eslab qolinadi."
+        )
+
+
+@router.message(Command("shablon_ochir"))
+async def cmd_template_delete(message: Message):
+    uid = message.from_user.id
+    name = message.text.removeprefix("/shablon_ochir").strip()
+    if not name:
+        await message.answer("Foydalanish: /shablon_ochir <nom>")
+        return
+    ok = await asyncio.to_thread(db_delete_template, uid, name)
+    await message.answer(f"🗑 «{name}» shabloni o'chirildi." if ok else f"«{name}» topilmadi. Ro'yxat: /shablon")
+
+
 async def agent_respond_project(message: Message, uid: int, text: str):
     """Loyiha rejimida javob: alohida rol + alohida kontekst, javob har doim matnda."""
     answer = await ask_agent(
@@ -2870,6 +3124,8 @@ async def handle_voice(message: Message, bot: Bot):
         # Keyin matn sifatida agentga yuboramiz
         if uid in project_mode_users:
             await agent_respond_project(message, uid, text)
+        elif uid in code_mode_users:
+            await agent_respond_code(message, uid, text)
         else:
             await agent_respond(message, message.from_user.id, [types.Part.from_text(text=text)])
     except Exception:
@@ -2896,9 +3152,34 @@ async def handle_photo(message: Message, bot: Bot):
         # Rasmni eslab qolamiz — keyin "buni fonini o'chir" desa ishlatamiz (15 daqiqa)
         last_user_image[uid] = (img_data, "image/jpeg", time.time())
 
+        # "shablon: nom" — rasmni doimiy shablon sifatida saqlaymiz
+        tname = _parse_template_save(caption) if caption else None
+        if tname is not None:
+            saved = await asyncio.to_thread(db_save_template, uid, tname, img_data, "image/jpeg")
+            await message.answer(
+                f"🗂 Shablon saqlandi: «{saved}»\n\n"
+                f"Ishlatish: rasm yuborib «{saved} shabloniga joylashtir» yoki matnda "
+                f"«{saved} shablonini ... qilib ber» deng.\n"
+                "Ro'yxat: /shablon"
+            )
+            return
+
+        # Caption'da saqlangan shablon nomi bo'lsa — bu rasmni SHABLON USTIGA joylashtiramiz
+        if caption:
+            names = await asyncio.to_thread(db_list_templates, uid)
+            tref = _find_template_ref(caption, names) if names else None
+            if tref:
+                tpl = await asyncio.to_thread(db_get_template, uid, tref)
+                if tpl:
+                    await edit_and_send(
+                        message, tpl["image"], caption, tpl["mime"],
+                        extra_images=[(img_data, "image/jpeg")], pro=True,
+                    )
+                    return
+
         # Izoh tahrir buyrug'imi (savol emas)? -> rasmni tahrirlaymiz
         if caption and _is_edit_instruction(caption) and not _is_analysis_question(caption):
-            await edit_and_send(message, img_data, caption, "image/jpeg")
+            await edit_and_send(message, img_data, caption, "image/jpeg", pro=_wants_pro(caption))
             return
 
         # Aks holda: tahlil qilamiz (chek/matn/tushuntirish)
@@ -2924,10 +3205,16 @@ async def handle_photo(message: Message, bot: Bot):
         await message.answer("Rasmni o'qishda xatolik 😕 Qaytadan urinib ko'ring.")
 
 
-async def edit_and_send(message: Message, img_bytes: bytes, prompt: str, mime: str):
+async def edit_and_send(
+    message: Message, img_bytes: bytes, prompt: str, mime: str,
+    extra_images: list | None = None, pro: bool = False,
+):
     """Rasmni tahrirlab, natijani yuboradi. Muvaffaqiyatsiz bo'lsa xabar beradi."""
     await message.bot.send_chat_action(message.chat.id, ChatAction.UPLOAD_PHOTO)
-    out_img, out_text, reason = await asyncio.to_thread(do_edit_image, img_bytes, prompt, mime)
+    model = IMAGE_MODEL_PRO if (pro or extra_images) else None
+    out_img, out_text, reason = await asyncio.to_thread(
+        do_edit_image, img_bytes, prompt, mime, extra_images, model,
+    )
     if out_img:
         # Tahrirlangan rasmni keyingi tahrir uchun ham eslab qolamiz (zanjir bo'lib tahrirlash)
         last_user_image[message.from_user.id] = (out_img, "image/png", time.time())
@@ -2988,6 +3275,12 @@ async def handle_document(message: Message, bot: Bot):
             text = await asyncio.to_thread(extract_xlsx, data)
         elif fname.endswith((".txt", ".csv", ".md", ".json")):
             text = data.decode("utf-8", errors="ignore")
+        elif fname.endswith(_CODE_EXTS):
+            # Kod fayli — senior dasturchi sifatida ko'rib chiqamiz (/kod rejimi shart emas)
+            code = data.decode("utf-8", errors="ignore")[:30000]
+            ask = caption.strip() or "Bu kodni to'liq ko'rib chiq: xatolar, xavfsizlik, optimallashtirish, refactor tavsiyalari."
+            await agent_respond_code(message, uid, f"{ask}\n\nFayl: {doc.file_name}\n```\n{code}\n```")
+            return
         elif fname.endswith(".doc"):
             await message.answer("Eski .doc formati qo'llab-quvvatlanmaydi. Iltimos .docx ga aylantiring.")
             return
@@ -3029,13 +3322,31 @@ async def handle_text(message: Message, bot: Bot):
             await message.answer("⏰ Ish vaqti saqlandi!\nPanelga qaytish: /biznes")
         return
 
+    # Saqlangan shablonni matn orqali ishlatish: "banner shablonini ... qil"
+    if ("shablon" in message.text.lower() or "template" in message.text.lower()) \
+            and uid not in onboarding_state and not _is_analysis_question(message.text):
+        names = await asyncio.to_thread(db_list_templates, uid)
+        tref = _find_template_ref(message.text, names) if names else None
+        if tref:
+            tpl = await asyncio.to_thread(db_get_template, uid, tref)
+            if tpl:
+                fresh = last_user_image.get(uid)
+                extra = [(fresh[0], fresh[1])] if fresh and (time.time() - fresh[2] < 900) else None
+                await edit_and_send(message, tpl["image"], message.text.strip(), tpl["mime"],
+                                    extra_images=extra, pro=True)
+                return
+        elif names:
+            await message.answer("Qaysi shablon? Mavjudlar: " + ", ".join(f"«{n}»" for n in names))
+            return
+
     # Yaqinda rasm yuklagan bo'lsa: tahrir buyrug'i YOKI "rasm/surat/shunday qil" desa —
     # o'sha namuna rasmni ishlatib tahrirlaymiz (savol bo'lmasa). Namunani e'tiborsiz qoldirmaslik uchun.
     img_entry = last_user_image.get(uid)
     if img_entry and (time.time() - img_entry[2] < 900) and uid not in onboarding_state \
             and not _is_analysis_question(message.text) \
             and (_is_edit_instruction(message.text) or _mentions_image(message.text)):
-        await edit_and_send(message, img_entry[0], message.text.strip(), img_entry[1])
+        await edit_and_send(message, img_entry[0], message.text.strip(), img_entry[1],
+                            pro=_wants_pro(message.text))
         return
 
     # Onboarding jarayoni
@@ -3107,6 +3418,9 @@ async def handle_text(message: Message, bot: Bot):
     try:
         if uid in project_mode_users:
             await agent_respond_project(message, uid, message.text)
+        elif uid in code_mode_users or _looks_like_error(message.text):
+            # /kod rejimi yoki xabar traceback/xatoga o'xshasa — senior dasturchi sifatida tahlil
+            await agent_respond_code(message, uid, message.text)
         else:
             await agent_respond(message, message.from_user.id, [types.Part.from_text(text=message.text)])
     except Exception:
@@ -3197,6 +3511,9 @@ async def main():
             BotCommand(command="biznes", description="💼 Avto-javob (Telegram Business)"),
             BotCommand(command="loyiha", description="🚀 Loyiha maslahatchisi: g'oya → strategiya → UX"),
             BotCommand(command="loyiha_chiqish", description="Loyiha rejimidan chiqish"),
+            BotCommand(command="kod", description="👨‍💻 Kod review / xato tahlili"),
+            BotCommand(command="kod_chiqish", description="Kod rejimidan chiqish"),
+            BotCommand(command="shablon", description="🗂 Rasm shablonlarim"),
             BotCommand(command="hisobot", description="Oylik moliyaviy hisobot"),
             BotCommand(command="eslatmalar", description="Faol eslatmalar"),
             BotCommand(command="clear", description="Suhbat tarixini tozalash"),
