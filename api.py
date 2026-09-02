@@ -17,11 +17,13 @@ Railway'da alohida "web" servis sifatida:
 """
 
 import os
+import json
+import asyncio
 import logging
 
 from fastapi import FastAPI, UploadFile, File, Form, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response
+from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel
 from google.genai import types
 
@@ -90,6 +92,52 @@ async def chat(req: ChatRequest, authorization: str | None = Header(default=None
         device_action_sink=actions, chat_id=req.chat_id,
     )
     return ChatResponse(reply=reply, actions=actions)
+
+
+@app.post("/chat/stream")
+async def chat_stream(req: ChatRequest, authorization: str | None = Header(default=None)):
+    """SSE streaming: `data: {"delta": "..."}` bo'laklar, oxirida `data: {"done": true, "reply", "actions"}`.
+    Ilova matnni asta-sekin ko'rsatadi; xato bo'lsa ham done-event bilan yakunlanadi."""
+    _check_auth(authorization)
+    bot.db_track_user(req.user_id, None, req.name or "Ilova foydalanuvchisi")
+    bot.db_approve_user(req.user_id)
+
+    loop = asyncio.get_running_loop()
+    queue: asyncio.Queue = asyncio.Queue()
+
+    def on_delta(text: str):
+        # ask_agent ichidagi worker thread'dan chaqiriladi
+        loop.call_soon_threadsafe(queue.put_nowait, text)
+
+    async def run():
+        actions: list = []
+        try:
+            reply = await bot.ask_agent(
+                req.user_id, [types.Part.from_text(text=req.text)],
+                device_action_sink=actions, chat_id=req.chat_id, on_delta=on_delta,
+            )
+        except Exception:
+            logger.exception("chat_stream xato")
+            reply = "Xatolik yuz berdi, qaytadan urinib ko'ring."
+        await queue.put({"done": True, "reply": reply, "actions": actions})
+
+    async def gen():
+        task = asyncio.create_task(run())
+        try:
+            while True:
+                item = await queue.get()
+                if isinstance(item, dict):
+                    yield f"data: {json.dumps(item, ensure_ascii=False)}\n\n"
+                    break
+                yield f"data: {json.dumps({'delta': item}, ensure_ascii=False)}\n\n"
+        finally:
+            if not task.done():
+                task.cancel()
+
+    return StreamingResponse(
+        gen(), media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 class SpeakRequest(BaseModel):

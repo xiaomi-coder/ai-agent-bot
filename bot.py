@@ -1976,6 +1976,47 @@ def gemini_generate(model: str, contents, config=None):
     raise last_exc
 
 
+class _StreamedResponse:
+    """generate_content_stream natijasini ask_agent kutgan shaklga keltiradi (candidates + text)."""
+
+    def __init__(self, parts: list, finish_reason=None):
+        from types import SimpleNamespace
+        content = types.Content(role="model", parts=parts)
+        self.candidates = [SimpleNamespace(content=content, finish_reason=finish_reason, safety_ratings=None)]
+        self.prompt_feedback = None
+        self.text = "".join(p.text for p in parts if getattr(p, "text", None)) or None
+
+
+def _generate_streaming(contents, config, on_delta):
+    """Ilova uchun streaming: matn bo'laklari kelishi bilan on_delta(str) chaqiriladi.
+    Funksiya chaqiruvi paydo bo'lsa — delta yuborilmaydi (ask_agent sikli odatdagidek ishlaydi).
+    Streaming ishlamasa — oddiy gemini_generate'ga tushadi (ishonchlilik saqlanadi)."""
+    parts: list = []
+    saw_fc = False
+    finish = None
+    try:
+        for chunk in client.models.generate_content_stream(model=MODEL, contents=contents, config=config):
+            cand = chunk.candidates[0] if chunk.candidates else None
+            if cand is None:
+                continue
+            finish = getattr(cand, "finish_reason", finish) or finish
+            for part in ((cand.content.parts or []) if cand.content else []):
+                if part.function_call:
+                    saw_fc = True
+                parts.append(part)
+                if part.text and not saw_fc:
+                    try:
+                        on_delta(part.text)
+                    except Exception:
+                        pass
+        if parts:
+            return _StreamedResponse(parts, finish)
+        logger.warning("streaming: bo'sh javob — oddiy chaqiruvga tushamiz")
+    except Exception:
+        logger.exception("streaming xato — oddiy chaqiruvga tushamiz")
+    return gemini_generate(model=MODEL, contents=contents, config=config)
+
+
 def _save_history(user_id: int, user_parts: list[types.Part], answer: str, chat_id: int = 0):
     """Foydalanuvchi xabari va javobni tarixga saqlaydi (kontekst saqlanishi uchun)."""
     key = (user_id, chat_id)
@@ -2004,6 +2045,7 @@ async def ask_agent(
     system_prompt: str | None = None,
     allow_tools: bool = True,
     tools_override: list | None = None,
+    on_delta=None,  # berilsa — javob matni bo'laklab (streaming) shu callback'ga keladi (ilova SSE)
 ) -> str:
     # Birinchi murojaatda (yoki restartdan keyin) tarixni bazadan tiklaymiz
     key = (user_id, chat_id)
@@ -2037,9 +2079,12 @@ async def ask_agent(
 
     answer = "Kechirasiz, javob topa olmadim. Boshqacharoq so'rab ko'ring."
     for _ in range(6):
-        response = await asyncio.to_thread(
-            gemini_generate, model=MODEL, contents=contents, config=config,
-        )
+        if on_delta is not None:
+            response = await asyncio.to_thread(_generate_streaming, contents, config, on_delta)
+        else:
+            response = await asyncio.to_thread(
+                gemini_generate, model=MODEL, contents=contents, config=config,
+            )
         if not response.candidates:
             logger.warning("ask_agent: bo'sh candidates. prompt_feedback=%s", getattr(response, "prompt_feedback", None))
             break

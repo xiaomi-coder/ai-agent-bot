@@ -9,17 +9,19 @@ Foydalanuvchi bilan muloqot **o'zbekcha**; texnik atamalar inglizcha qolaveradi.
 | Fayl | Vazifa |
 |---|---|
 | `bot.py` (~3700 qator) | Butun mantiq: DB, Gemini agent, funksiyalar, handlerlar, rejimlar |
-| `api.py` | FastAPI — ilova uchun `/chat`, `/voice`, `/speak` (Bearer `API_SECRET`) |
+| `sirdosh_text.py` | TOZA matn yordamchilari (transliteratsiya, aniqlash, Markdown→HTML) — env'siz import bo'ladi |
+| `api.py` | FastAPI — ilova uchun `/chat`, `/chat/stream` (SSE), `/voice`, `/speak` (Bearer `API_SECRET`) |
 | `main.py` | Bot + API bitta jarayonda (`python main.py`) |
 | `nixpacks.toml` | Railway build'ga `ffmpeg` (TTS → OGG/Opus voice bubble) |
-| `requirements.txt` | Versiyalar yuqori chegara bilan (`<4`, `<2`) — aniq pin hali yo'q |
+| `requirements.txt` | Aniq `==` pin (Railway startup logidagi versiyalar). Yangilash: scratch venv'da sinab, keyin pin |
 
 Android ilova alohida repoda: `~/developer/shoxa-android` (Kotlin/Compose).
 
 ## Deploy
 
 - Hosting: **Railway** (Postgres ham o'sha yerda). `git push origin main` → avtomatik deploy (~1-2 daqiqa). VPS yo'q.
-- Push'dan oldin **har doim**: `python3 -m py_compile bot.py api.py main.py` + o'zgargan helper'larni izolyatsiyada sinash.
+- Push'dan oldin **har doim**: `python3 -m py_compile bot.py api.py main.py` + **lokal import-harness** (scratch venv'da
+  `import bot, api, main` dummy env bilan — py_compile yo'qolgan simvollarni ko'rmaydi, harness ko'radi) + helper'larni izolyatsiyada sinash.
 - Lokalda `.env` va kutubxonalar yo'q — bot lokalda ishga tushmaydi. Jonli tekshirish uchun Railway CLI:
   `railway variables --service ai-agent-bot --json` (kalitlarni olib API'ni to'g'ridan-to'g'ri sinash mumkin).
 - Xatolar adminga Telegram orqali keladi (`AdminAlertHandler`, `ADMIN_ID`) — loglarni qo'lda titkilash shart emas.
@@ -31,7 +33,7 @@ Env: `BOT_TOKEN GEMINI_API_KEY DATABASE_URL ADMIN_ID API_SECRET GEMINI_MODEL GEM
 Real foydalanuvchilar bor. **Migratsiyalar faqat additiv**: `CREATE TABLE IF NOT EXISTS`,
 `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`. Hech qachon DROP/RENAME/destruktiv UPDATE yo'q.
 Jadvallar: `users profiles transactions reminders notes(+title,tags,code,lang) long_memory chat_history(user_id,chat_id)
-business_chats business_log image_templates(BYTEA)`.
+business_chats business_log image_templates(BYTEA) budgets`.
 
 ## Gemini modellari — TUZOQLAR
 
@@ -57,6 +59,8 @@ business_chats business_log image_templates(BYTEA)`.
   Kontekst kaliti `(user_id, chat_id)`; RAM + Postgres (`chat_history`). `chat_id`: 0 = Telegram oddiy,
   777 = /loyiha, 778 = /kod, 779 = /dizayn, ilova = o'z ID'lari (millis), biznes = mijoz chat ID'si.
 - Tarix limiti: oddiy 20 almashinuv, 777/778/779 uchun 60 (`_history_limit`).
+- Streaming: `ask_agent(..., on_delta=cb)` → `_generate_streaming` (funksiya chaqiruvi bo'lsa delta yubormaydi, xatoda oddiy chaqiruvga tushadi); `api.py` `/chat/stream` SSE.
+- Byudjet: `budgets` jadvali, `set_budget/list_budgets`; `add_transaction` chiqimda 80%/100% ogohlantirish qo'shadi.
 - **Begona suhbatdoshlar (Telegram Business) uchun faqat `SAFE_BUSINESS_DECLARATIONS`** (web_search, ob-havo,
   kurs, fetch_url). Egasining moliya/eslatma/qayd funksiyalari ularga OCHILMAYDI.
 - Javob chiqishi `send_long()`: Markdown → Telegram **HTML** (`_md_to_html`), kod bloklari nusxalanadigan,
@@ -92,10 +96,12 @@ AI ekanini aytmaydi) javob beradi; `send_business_message` funksiyasi egasi "X g
 - API kaliti `app/build.gradle.kts` ichida (`API_SECRET`) — Railway'dagi `API_SECRET` bilan **bir xil** bo'lishi shart.
 - Build: tizim Java 25 mos emas — `JAVA_HOME="/Applications/Android Studio.app/Contents/jbr/Contents/Home" ./gradlew assembleDebug`.
 - Suhbatlar `ChatStore` (JSON fayl), har suhbat backend'ga `chat_id` yuboradi. Quick Settings tile, budilnik (sana bilan).
+- Davomiy suhbat (sozlama `conv_mode`): javobdan keyin `startConversationTurn()` yana tinglaydi, 6s jimlik yoki «bo'ldi/to'xta» — tugaydi.
+- Matn javobi `ApiClient.sendTextStream` (SSE) bilan asta-sekin chiqadi, ishlamasa `sendText`ga tushadi.
 
 ## Ish uslubi
 
 - Foydalanuvchi o'zbekcha yozadi, tez natija kutadi: tuzatish → compile → sinov → commit → push (u odatda "xa" deydi).
 - Xotira fayllari (`~/.claude/projects/.../memory/`) va bu CLAUDE.md ni sinxron tut.
-- Roadmap (qolgan): xarajat himoyasi/rate-limit, kunlik shaxsiy xulosa 21:00, takroriy eslatmalar, byudjet limitlari,
-  aniq versiya pin, bot.py ni modullarga bo'lish, ilova: davomiy ovozli suhbat, streaming, FCM push.
+- Roadmap (qolgan): xarajat himoyasi/rate-limit, model sog'liq tekshiruvi, kunlik shaxsiy xulosa 21:00, takroriy eslatmalar,
+  bot.py ni modullarga bo'lish (2-bosqich: DB, tools, handlers), ilova: FCM push.
