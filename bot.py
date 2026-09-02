@@ -164,6 +164,16 @@ def db_init():
                     UNIQUE (user_id, name)
                 )
             """)
+            # Byudjet limitlari: kategoriya bo'yicha oylik chegara
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS budgets (
+                    user_id BIGINT NOT NULL,
+                    category TEXT NOT NULL,
+                    monthly_limit REAL NOT NULL,
+                    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                    PRIMARY KEY (user_id, category)
+                )
+            """)
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS profiles (
                     user_id BIGINT PRIMARY KEY,
@@ -203,6 +213,88 @@ def db_init():
 
 # --- Buxgalteriya ---
 
+def _norm_cat(category: str) -> str:
+    return (category or "boshqa").strip().lower()
+
+
+def db_set_budget(user_id: int, category: str, monthly_limit: float) -> str:
+    cat = _norm_cat(category)
+    if monthly_limit <= 0:
+        ok = db_delete_budget(user_id, cat)
+        return f"«{cat}» byudjeti o'chirildi." if ok else f"«{cat}» uchun byudjet yo'q edi."
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO budgets (user_id, category, monthly_limit) VALUES (%s, %s, %s)
+                ON CONFLICT (user_id, category) DO UPDATE SET monthly_limit = EXCLUDED.monthly_limit
+            """, (user_id, cat, monthly_limit))
+    spent = db_month_spent(user_id, cat)
+    return f"Byudjet o'rnatildi: «{cat}» — oyiga {monthly_limit:,.0f} so'm (shu oyda sarflangan: {spent:,.0f})."
+
+
+def db_delete_budget(user_id: int, category: str) -> bool:
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM budgets WHERE user_id = %s AND category = %s", (user_id, _norm_cat(category)))
+            return cur.rowcount > 0
+
+
+def db_month_spent(user_id: int, category: str | None = None) -> float:
+    """Joriy oyda chiqim summasi (kategoriya berilsa faqat o'sha)."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            if category:
+                cur.execute("""
+                    SELECT COALESCE(SUM(amount), 0) AS s FROM transactions
+                    WHERE user_id = %s AND type = 'chiqim' AND LOWER(category) = %s
+                      AND created_at >= date_trunc('month', NOW())
+                """, (user_id, _norm_cat(category)))
+            else:
+                cur.execute("""
+                    SELECT COALESCE(SUM(amount), 0) AS s FROM transactions
+                    WHERE user_id = %s AND type = 'chiqim' AND created_at >= date_trunc('month', NOW())
+                """, (user_id,))
+            return float(cur.fetchone()["s"] or 0)
+
+
+def db_list_budgets(user_id: int) -> str:
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT category, monthly_limit FROM budgets WHERE user_id = %s ORDER BY category", (user_id,))
+            rows = cur.fetchall()
+    if not rows:
+        return "Byudjet limitlari o'rnatilmagan. Masalan: «oziq-ovqatga oyiga 2 mln limit qo'y»."
+    lines = []
+    for r in rows:
+        spent = db_month_spent(user_id, r["category"])
+        lim = float(r["monthly_limit"])
+        pct = (spent / lim * 100) if lim else 0
+        bar = "🔴" if pct >= 100 else ("🟡" if pct >= 80 else "🟢")
+        lines.append(f"{bar} {r['category']}: {spent:,.0f} / {lim:,.0f} so'm ({pct:.0f}%)")
+    return "Shu oy byudjetlari:\n" + "\n".join(lines)
+
+
+def _budget_warning(user_id: int, category: str) -> str:
+    """Chiqimdan keyin: limitga yaqin/oshgan bo'lsa ogohlantirish matni, aks holda ''."""
+    cat = _norm_cat(category)
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT monthly_limit FROM budgets WHERE user_id = %s AND category = %s", (user_id, cat))
+            r = cur.fetchone()
+    if not r:
+        return ""
+    lim = float(r["monthly_limit"])
+    spent = db_month_spent(user_id, cat)
+    pct = spent / lim * 100 if lim else 0
+    if pct >= 100:
+        return (f"\n🔴 DIQQAT: «{cat}» byudjeti OSHDI — {spent:,.0f} / {lim:,.0f} so'm ({pct:.0f}%). "
+                f"Foydalanuvchiga buni aniq ayt va qisqa maslahat ber.")
+    if pct >= 80:
+        return (f"\n🟡 Ogohlantirish: «{cat}» byudjetining {pct:.0f}% ishlatildi — "
+                f"{spent:,.0f} / {lim:,.0f} so'm, qolgan {lim - spent:,.0f}. Foydalanuvchiga ayt.")
+    return ""
+
+
 def db_add_transaction(user_id: int, tx_type: str, amount: float, category: str, note: str) -> str:
     with get_conn() as conn:
         with conn.cursor() as cur:
@@ -210,7 +302,13 @@ def db_add_transaction(user_id: int, tx_type: str, amount: float, category: str,
                 "INSERT INTO transactions (user_id, type, amount, category, note) VALUES (%s, %s, %s, %s, %s)",
                 (user_id, tx_type, amount, category, note),
             )
-    return f"Yozildi: {tx_type} {amount:,.0f} so'm, kategoriya: {category}" + (f" ({note})" if note else "")
+    result = f"Yozildi: {tx_type} {amount:,.0f} so'm, kategoriya: {category}" + (f" ({note})" if note else "")
+    if tx_type == "chiqim":
+        try:
+            result += _budget_warning(user_id, category)
+        except Exception:
+            logger.exception("Byudjet tekshiruvida xato")
+    return result
 
 
 def db_get_report(user_id: int, period: str = "oy", start_date: str = "", end_date: str = "") -> str:
@@ -1509,6 +1607,27 @@ FUNCTION_DECLARATIONS = [
         ),
     ),
     types.FunctionDeclaration(
+        name="set_budget",
+        description=(
+            "Kategoriya uchun OYLIK byudjet limiti o'rnatish. 'oziq-ovqatga oyiga 2 mln limit qo'y', "
+            "'transportga 500 ming chegara' desa ishlatiladi. 0 yoki 'o'chir' desa limit olib tashlanadi. "
+            "Limit 80% ga yetganda va oshganda chiqim yozilayotganda avtomatik ogohlantiriladi."
+        ),
+        parameters=types.Schema(
+            type=types.Type.OBJECT,
+            properties={
+                "category": types.Schema(type=types.Type.STRING, description="Kategoriya (transactions bilan bir xil nom: oziq-ovqat, transport...)"),
+                "monthly_limit": types.Schema(type=types.Type.NUMBER, description="Oylik limit so'mda; 0 = o'chirish"),
+            },
+            required=["category", "monthly_limit"],
+        ),
+    ),
+    types.FunctionDeclaration(
+        name="list_budgets",
+        description="Byudjet limitlari va shu oyda har birida qancha sarflangani. 'byudjetim qanday', 'limitlarim' desa.",
+        parameters=types.Schema(type=types.Type.OBJECT, properties={}),
+    ),
+    types.FunctionDeclaration(
         name="get_report",
         description="Kirim-chiqim hisoboti. 'Qancha sarfladim', 'hisobot', 'balans' desa ishlatiladi. Aniq sana oralig'i so'ralsa (masalan '1-iyundan 10-iyungacha', 'shu oyning 5-sanasi') start_date/end_date ber.",
         parameters=types.Schema(
@@ -1770,6 +1889,8 @@ Imkoniyatlaring:
    Rasm yaratish (generate_image) — "rasm chiz", "surat yaratib ber" desa ishlatiladi. Prompt ni ingliz tilida, JUDA batafsil yoz (uslub, yorug'lik, kompozitsiya, kayfiyat, sifat). Rasm TAHRIRLASH (foydalanuvchi rasm yuklab "buni o'zgartir/fon/rang..." desa) — buni tizim avtomatik bajaradi, sen aralashma.
    Hujjat (PDF/Word/Excel) — foydalanuvchi fayl yuborsa avtomatik o'qiysan va tahlil qilasan.
 3. Buxgalteriya — xarajat/daromad aytilsa add_transaction. Hisobot so'ralsa get_report.
+   Byudjet: "X ga oyiga N limit qo'y" → set_budget; "byudjetim/limitlarim" → list_budgets. add_transaction natijasida
+   🟡/🔴 ogohlantirish kelsa — uni foydalanuvchiga ALBATTA yetkaz (yumshoq, lekin aniq), o'tkazib yuborma.
 4. Eslatmalar — set_reminder (vaqtni aniq 'YYYY-MM-DD HH:MM' ga aylantir).
 5. Qaydlar va SNIPPET KUTUBXONASI — "eslab qol", "saqla", "snippet qil" desa add_note: xabarda kod/buyruq/konfig bo'lsa uni AYNAN, o'zgartirmasdan code'ga, tushuntirishni text'ga, qisqa title va mavzuga mos teglar (foydalanuvchi #teg yozgan bo'lsa shuni ol) ber. "... qanday edi?", "... snippetim", "#teg qaydlar" desa find_notes (query va/yoki tag). "№N ni ko'rsat" desa get_note. "teglarim" desa list_tags. Qayd natijasini (ayniqsa kod bloklarini) O'ZGARTIRMASDAN, qanday kelgan bo'lsa shundayligicha foydalanuvchiga yetkaz — u nusxalab ishlatadi.
 7. Suhbatdoshga xabar yuborish (send_business_message) — foydalanuvchi "X ga yozib yubor", "unga javob yubor", "xat yubor" desa DARHOL SHU funksiyani chaqir (Telegram Business orqali uning nomidan haqiqiy xabar ketadi). Foydalanuvchi aytgan nomni (masalan "developer") recipient sifatida to'g'ridan-to'g'ri ber — o'zingcha "bu kim ekan" deb mulohaza yuritma, funksiya o'zi topadi yoki ro'yxatni qaytaradi. QAT'IY: funksiya chaqirmasdan turib "yubordim" DEMA — bu yolg'on bo'ladi.
@@ -1829,6 +1950,10 @@ def execute_function(user_id: int, name: str, args: dict) -> str:
                 db_add_memory(user_id, fact)
                 return "Eslab qoldim ✅"
             return "Eslab qolinadigan narsa yo'q."
+        if name == "set_budget":
+            return db_set_budget(user_id, args.get("category", "boshqa"), float(args.get("monthly_limit", 0)))
+        if name == "list_budgets":
+            return db_list_budgets(user_id)
         if name == "add_transaction":
             return db_add_transaction(
                 user_id, args.get("tx_type", "chiqim"), float(args.get("amount", 0)),
