@@ -38,6 +38,10 @@ business_chats business_log image_templates(BYTEA) budgets`.
 ## Gemini modellari — TUZOQLAR
 
 - Asosiy va zaxira: `gemini-3.5-flash` (2026-09-01 dan). `gemini-2.5-flash` yangi kalitlar uchun **404** (retired).
+- **TUZOQ: Railway'dagi `GEMINI_MODEL` env kod default'ini BEKOR QILADI.** 2026-09-02 da env'da eski `gemini-2.5-flash`
+  qolib, har so'rov 2 marta 404 olib (+3s), keyingina zaxira modelga tushayotgan edi — bot "ishlagan", lekin sekin va
+  streaming'siz. Model almashtirganda KOD + `railway variables --set GEMINI_MODEL=...` ikkalasini yangila;
+  loglarda `Gemini xato (..., urinish 1)` takrorlansa — env eskirgan.
 - `ask_agent` config'ida `thinking_config=ThinkingConfig(thinking_budget=0)` bor. **`gemini-3.6-flash` va
   `gemini-3.5-flash-lite` buni RAD qiladi (400 INVALID_ARGUMENT)** — faqat 3.5-flash qabul qiladi.
   Model almashtirsang, thinking_config'ni ham tekshir.
