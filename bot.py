@@ -20,6 +20,7 @@ import logging
 import os
 import time
 import re
+import html as _html
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -2600,6 +2601,20 @@ Muammo bo'lmasa — "ko'rinadigan muammo yo'q" deb ochiq ayt, to'qima.
 
 AGAR SAVOL BO'LSA — qisqa tushuntirish + ishlaydigan kod misoli.
 
+SENIOR QOIDALARI (eng muhim — bularsiz javob junior bo'ladi):
+- ASYNC ICHIDA BLOKLOVCHI CHAQIRUV (psycopg2, requests, fayl I/O, time.sleep) bo'lsa — yechim HECH QACHON
+  "await'ni olib tashla" EMAS: bu event loop'ni bloklab, butun botni to'xtatadi. To'g'ri yechim:
+  `await asyncio.to_thread(func, ...)` / executor, yoki async drayver (asyncpg, httpx). Buni aniq ayt.
+- PUL / BUYURTMA / BALANS bilan ishlaydigan kodda BIRINCHI tekshir: amallar tartibi (balans yechish
+  to'lov tasdiqlanGANDAN keyin), tranzaksiya + rollback, idempotentlik (ikki marta bosish), xatoda
+  HALOL xabar (muvaffaqiyat xabari faqat haqiqiy muvaffaqiyatdan keyin). Bu "linter" xatolaridan ustun.
+- REFAKTORINGNI O'Z TASHXISINGGA QARSHI TEKSHIR: tashxisda aytgan HAR BIR muammo refaktorda hal
+  bo'lgan bo'lsin. "psycopg2 bloklaydi" deb, keyin refaktorda uni to'g'ridan-to'g'ri chaqirma.
+- ANIQLIK: bilmagan narsaga foiz/raqam TO'QIMA ("90% ehtimol" kabi). Taxmin bo'lsa "ehtimol" de.
+  Texnik atamalarni aralashtirma (masalan Telegram'da getFile = metadata API metodi,
+  /file/bot<token>/<path> = haqiqiy yuklab olish — bular turli narsalar).
+- Minimal emas, ARXITEKTURA jihatdan to'g'ri yechimni ber; workaround bo'lsa, uni workaround deb belgila.
+
 QOIDALAR:
 - Kodni HAR DOIM ``` bloklarida, til nomi bilan ber (```python, ```kotlin ...).
 - Yuborilgan kodning uslubi/kutubxonalariga mos yoz, boshqa stackga o'tkazma.
@@ -3428,18 +3443,72 @@ async def handle_text(message: Message, bot: Bot):
         await message.answer("Xatolik yuz berdi 😕 Qaytadan urinib ko'ring.")
 
 
+_FENCE_RE = re.compile(r"```([\w+.-]*)[ \t]*\n(.*?)```", re.S)
+
+
+def _md_inline_html(t: str) -> str:
+    """Oddiy matn qismini HTML'ga: escape + `code`, **bold**, # sarlavha."""
+    t = _html.escape(t)
+    t = re.sub(r"`([^`\n]+)`", r"<code>\1</code>", t)
+    t = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", t)
+    t = re.sub(r"^#{1,6}\s+(.+)$", r"<b>\1</b>", t, flags=re.M)
+    return t
+
+
+def _md_to_html(text: str) -> str:
+    """Model javobidagi Markdown'ni Telegram HTML'ga o'giradi (kod bloklari saqlanadi)."""
+    out, pos = [], 0
+    for m in _FENCE_RE.finditer(text):
+        out.append(_md_inline_html(text[pos:m.start()]))
+        lang, code = m.group(1), _html.escape(m.group(2).rstrip("\n"))
+        cls = f' class="language-{lang}"' if lang else ""
+        out.append(f"<pre><code{cls}>{code}</code></pre>")
+        pos = m.end()
+    out.append(_md_inline_html(text[pos:]))
+    return "".join(out)
+
+
+def _split_chunks(text: str, limit: int = 3500) -> list[str]:
+    """Matnni Telegram limitiga bo'ladi — KOD BLOKINI O'RTASIDAN KESMAYDI
+    (kerak bo'lsa blokni yopib, keyingi bo'lakda qayta ochadi)."""
+    chunks, cur, size, in_code, lang = [], [], 0, False, ""
+    for line in text.split("\n"):
+        st = line.strip()
+        is_fence = st.startswith("```")
+        if size + len(line) + 1 > limit and cur:
+            if in_code and not is_fence:
+                cur.append("```")
+                chunks.append("\n".join(cur))
+                cur, size = ["```" + lang], len(lang) + 4
+            else:
+                chunks.append("\n".join(cur))
+                cur, size = [], 0
+        if is_fence:
+            if not in_code:
+                in_code, lang = True, st[3:].strip()
+            else:
+                in_code = False
+        cur.append(line)
+        size += len(line) + 1
+    if cur:
+        chunks.append("\n".join(cur))
+    return chunks
+
+
 async def send_long(message: Message, text: str):
-    """Uzun matnni bo'lib yuboradi. Kod bloki (```) bo'lsa Markdown bilan — Telegram'da
-    "nusxalash" tugmasi chiqadi; Markdown xato bersa oddiy matnga tushadi."""
-    for i in range(0, len(text), 4000):
-        chunk = text[i:i + 4000]
-        if "```" in chunk:
+    """Uzun javobni bo'lib yuboradi. Markdown belgilar bo'lsa HTML'ga o'girib yuboradi
+    (kod bloklari nusxalanadigan bo'ladi, `_` kabi belgilar sindirmaydi); xato bo'lsa oddiy matn."""
+    for chunk in _split_chunks(text):
+        if any(m in chunk for m in ("```", "`", "**", "\n#")) or chunk.startswith("#"):
             try:
-                await message.answer(chunk, parse_mode="Markdown")
-                continue
+                html_txt = _md_to_html(chunk)
+                if len(html_txt) <= 4096:
+                    await message.answer(html_txt, parse_mode="HTML")
+                    continue
             except Exception:
-                pass  # noto'g'ri Markdown — oddiy matn sifatida yuboramiz
-        await message.answer(chunk)
+                pass  # HTML o'tmasa — oddiy matn
+        for i in range(0, len(chunk), 4000):
+            await message.answer(chunk[i:i + 4000])
 
 
 # ============================================================
