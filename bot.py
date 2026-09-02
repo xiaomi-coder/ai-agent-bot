@@ -2677,7 +2677,9 @@ async def agent_respond_code(message: Message, uid: int, text: str):
 DESIGN_CHAT_ID = 779
 design_mode_users: set[int] = set()
 
-_DESIGN_STRONG = ("claude design", "design prompt", "dizayn prompt", "ui prompt", "ux prompt",
+# Eslatma: qisqa tokenlar ("ui", "ux") bu ro'yxatda EMAS — ular substring sifatida
+# "bui prompt" kabi so'zlarga tushib ketadi; ular _DESIGN_WORDS_RE da so'z chegarasi bilan tekshiriladi.
+_DESIGN_STRONG = ("claude design", "design prompt", "dizayn prompt",
                   "dizayn uchun prompt", "landing uchun prompt", "sayt uchun prompt")
 _DESIGN_WORDS_RE = re.compile(
     r"\b(landing|lending|sayt|website|web-?site|ui|ux|dizayn|design|figma|lovable|v0|framer|"
