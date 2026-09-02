@@ -1991,29 +1991,36 @@ def _generate_streaming(contents, config, on_delta):
     """Ilova uchun streaming: matn bo'laklari kelishi bilan on_delta(str) chaqiriladi.
     Funksiya chaqiruvi paydo bo'lsa — delta yuborilmaydi (ask_agent sikli odatdagidek ishlaydi).
     Streaming ishlamasa — oddiy gemini_generate'ga tushadi (ishonchlilik saqlanadi)."""
-    parts: list = []
-    saw_fc = False
-    finish = None
-    try:
-        for chunk in client.models.generate_content_stream(model=MODEL, contents=contents, config=config):
-            cand = chunk.candidates[0] if chunk.candidates else None
-            if cand is None:
-                continue
-            finish = getattr(cand, "finish_reason", finish) or finish
-            for part in ((cand.content.parts or []) if cand.content else []):
-                if part.function_call:
-                    saw_fc = True
-                parts.append(part)
-                if part.text and not saw_fc:
-                    try:
-                        on_delta(part.text)
-                    except Exception:
-                        pass
-        if parts:
-            return _StreamedResponse(parts, finish)
-        logger.warning("streaming: bo'sh javob — oddiy chaqiruvga tushamiz")
-    except Exception:
-        logger.exception("streaming xato — oddiy chaqiruvga tushamiz")
+    # Asosiy model ishlamasa (masalan retired/404) — zaxira modelda ham STREAMING'ni sinaymiz;
+    # faqat ikkalasi ham yiqilsa oddiy (streaming'siz) chaqiruvga tushamiz.
+    for use_model in dict.fromkeys((MODEL, FALLBACK_MODEL)):
+        parts: list = []
+        saw_fc = False
+        finish = None
+        try:
+            for chunk in client.models.generate_content_stream(model=use_model, contents=contents, config=config):
+                cand = chunk.candidates[0] if chunk.candidates else None
+                if cand is None:
+                    continue
+                finish = getattr(cand, "finish_reason", finish) or finish
+                for part in ((cand.content.parts or []) if cand.content else []):
+                    if part.function_call:
+                        saw_fc = True
+                    parts.append(part)
+                    if part.text and not saw_fc:
+                        try:
+                            on_delta(part.text)
+                        except Exception:
+                            pass
+            if parts:
+                return _StreamedResponse(parts, finish)
+            logger.warning("streaming (%s): bo'sh javob", use_model)
+        except Exception as e:
+            # Delta allaqachon yuborilgan bo'lsa, boshqa model bilan takrorlash matnni ikkilantiradi — to'xtaymiz
+            if parts:
+                logger.exception("streaming (%s) o'rtasida uzildi", use_model)
+                break
+            logger.warning("streaming (%s) xato: %s — keyingi variant", use_model, str(e)[:160])
     return gemini_generate(model=MODEL, contents=contents, config=config)
 
 
